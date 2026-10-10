@@ -42,7 +42,7 @@
 </head>
 <body class="list">
 <aside>
-  <header><strong class="grow">Paseo Lite</strong><span id="conn" class="small mute">offline</span><button id="newBtn" class="primary">New</button></header>
+  <header><strong class="grow">Paseo Lite</strong><span id="conn" class="small mute">offline</span><button id="connBtn" title="Connect from the Paseo app or web via the relay">Connect</button><button id="newBtn" class="primary">New</button></header>
   <div id="agents"></div>
 </aside>
 <main>
@@ -57,6 +57,16 @@
   <div id="perms"></div>
   <form id="composer"><textarea id="input" placeholder="Message the agent… (Ctrl+Enter to send)"></textarea><button class="primary">Send</button></form>
 </main>
+<dialog id="connDlg">
+  <form method="dialog">
+    <strong>Connect via relay</strong>
+    <p class="small mute">Open the link on <b>app.paseo.sh</b> (or scan the QR with the Paseo app) to reach this daemon from anywhere. Traffic is end-to-end encrypted; the relay only sees ciphertext. <b>Anyone with this link can control your agents</b> - keep it private.</p>
+    <div id="connQr" style="background:#fff;border-radius:8px;padding:6px;width:max-content;max-width:100%;margin:8px auto"></div>
+    <label>Pairing link</label><input id="connUrl" readonly>
+    <p id="connErr" class="err"></p>
+    <div style="display:flex;gap:8px;justify-content:flex-end"><button type="button" id="connCopy">Copy link</button><button type="button" id="connOpen" class="primary">Open app.paseo.sh</button><button value="close">Close</button></div>
+  </form>
+</dialog>
 <dialog id="newDlg">
   <form method="dialog" id="newForm">
     <strong>New agent</strong>
@@ -259,6 +269,17 @@ $("nCreate").onclick = async (e) => {
   $("nPrompt").value = ""; $("newDlg").close();
   agents.set(r.payload.agent.id, r.payload.agent); select(r.payload.agent.id);
 };
+$("connBtn").onclick = async () => {
+  $("connErr").textContent = ""; $("connUrl").value = ""; $("connQr").innerHTML = "";
+  $("connDlg").showModal();
+  const r = await rpc({ type: "daemon.get_pairing_offer.request" });
+  const p = r.payload;
+  if (!p.relayEnabled) { $("connErr").textContent = "Relay is disabled on this daemon (PASEO_RELAY_ENABLED=false)."; return; }
+  $("connUrl").value = p.url;
+  if (p.qr) $("connQr").innerHTML = p.qr.replace(/<\?xml[^>]*\?>/, "").replace(/<!DOCTYPE[^>]*>/, "");
+};
+$("connCopy").onclick = async () => { $("connUrl").select(); try { await navigator.clipboard.writeText($("connUrl").value); } catch { document.execCommand("copy"); } };
+$("connOpen").onclick = () => { if ($("connUrl").value) window.open($("connUrl").value, "_blank", "noopener"); };
 connect();
 </script>
 </body>

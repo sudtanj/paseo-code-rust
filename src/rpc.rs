@@ -247,6 +247,16 @@ impl Manager {
                 let entries: Vec<Value> = dirs.iter().map(|d| json!({ "path": d, "kind": "directory" })).collect();
                 reply(out, json!({ "type": "directory_suggestions_response", "payload": { "directories": dirs, "entries": entries, "error": null, "requestId": rid } }));
             }
+            "daemon.get_pairing_offer.request" => {
+                let (url, qr) = match &self.pairing_url {
+                    Some(u) => {
+                        let svg = qrcode::QrCode::new(u.as_bytes()).ok().map(|c| c.render::<qrcode::render::svg::Color>().min_dimensions(240, 240).quiet_zone(true).build());
+                        (u.clone(), svg)
+                    }
+                    None => (String::new(), None),
+                };
+                reply(out, json!({ "type": "daemon.get_pairing_offer.response", "payload": { "requestId": rid, "url": url, "qr": qr, "relayEnabled": self.pairing_url.is_some() } }));
+            }
             "client_heartbeat" | "register_push_token" | "abort_request" => {}
             "ping" => {
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);

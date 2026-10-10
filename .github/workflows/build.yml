@@ -29,3 +29,35 @@ jobs:
         with:
           name: paseo-lite-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/paseo-lite
+
+  # Static musl binary for the Docker image (Alpine). Published as a rolling
+  # "latest" release so the image build downloads it instead of compiling.
+  release:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --target x86_64-unknown-linux-musl
+      - name: Publish rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          bin=paseo-lite-x86_64-linux-musl
+          cp target/x86_64-unknown-linux-musl/release/paseo-lite "$bin"
+          sha256sum "$bin" > "$bin.sha256"
+          git tag -f latest
+          git push -f origin latest
+          if gh release view latest >/dev/null 2>&1; then
+            gh release upload latest "$bin" "$bin.sha256" --clobber
+            gh release edit latest --target "$GITHUB_SHA" --latest=false
+          else
+            gh release create latest "$bin" "$bin.sha256" --title "latest" --notes "Rolling build of main for the Docker image" --target "$GITHUB_SHA" --latest=false
+          fi

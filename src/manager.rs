@@ -49,6 +49,8 @@ pub struct Manager {
     pub bcast: broadcast::Sender<Arc<str>>,
     pub events_tx: mpsc::UnboundedSender<ProviderEvent>,
     pub agents_dirty: bool,
+    /// Relay pairing link (None when the relay is disabled).
+    pub pairing_url: Option<String>,
 }
 
 pub fn wrap(msg: Value) -> Arc<str> {
@@ -60,7 +62,7 @@ pub fn reply(out: &Out, msg: Value) {
 }
 
 impl Manager {
-    pub fn new(cfg: Config, server_id: String, bcast: broadcast::Sender<Arc<str>>) -> (Manager, mpsc::UnboundedReceiver<ProviderEvent>) {
+    pub fn new(cfg: Config, server_id: String, pairing_url: Option<String>, bcast: broadcast::Sender<Arc<str>>) -> (Manager, mpsc::UnboundedReceiver<ProviderEvent>) {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let store = Store::new(cfg.home.clone());
         let mut agents = HashMap::new();
