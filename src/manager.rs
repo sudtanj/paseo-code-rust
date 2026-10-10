@@ -6,7 +6,7 @@ use crate::config::Config;
 use crate::providers::claude::{ClaudePool, SendOutcome};
 use crate::providers::codex::Codex;
 use crate::providers::{AgentSpec, ProviderEvent};
-use crate::store::{AgentRecord, Row, Store};
+use crate::store::{AgentRecord, ProjectRecord, Row, Store};
 use crate::util::{new_id, now_iso};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -21,6 +21,9 @@ pub const EPOCH: &str = "e1";
 pub enum Cmd {
     /// A session-level message (already unwrapped from the `session` envelope).
     Rpc { msg: Value, out: Out },
+    /// Register a directory produced by background work (GitHub clone), then
+    /// send `response` with `payload.project` filled in.
+    RegisterProject { path: String, out: Out, response: Value },
 }
 
 pub struct Permission {
@@ -51,6 +54,10 @@ pub struct Manager {
     pub agents_dirty: bool,
     /// Relay pairing link (None when the relay is disabled).
     pub pairing_url: Option<String>,
+    /// Directories added as projects, in insertion order.
+    pub projects: Vec<ProjectRecord>,
+    /// Lets background tasks hand results back to the manager.
+    pub cmds_tx: mpsc::UnboundedSender<Cmd>,
 }
 
 pub fn wrap(msg: Value) -> Arc<str> {
@@ -62,17 +69,36 @@ pub fn reply(out: &Out, msg: Value) {
 }
 
 impl Manager {
-    pub fn new(cfg: Config, server_id: String, pairing_url: Option<String>, bcast: broadcast::Sender<Arc<str>>) -> (Manager, mpsc::UnboundedReceiver<ProviderEvent>) {
+    pub fn new(
+        cfg: Config,
+        server_id: String,
+        pairing_url: Option<String>,
+        bcast: broadcast::Sender<Arc<str>>,
+        cmds_tx: mpsc::UnboundedSender<Cmd>,
+    ) -> (Manager, mpsc::UnboundedReceiver<ProviderEvent>) {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let store = Store::new(cfg.home.clone());
         let mut agents = HashMap::new();
         for rec in store.load_agents() {
             agents.insert(rec.id.clone(), Agent::new(rec));
         }
-        crate::log!("loaded {} agents", agents.len());
+        let projects = store.load_projects();
+        crate::log!("loaded {} agents, {} projects", agents.len(), projects.len());
         let claude = ClaudePool::new(cfg.clone(), events_tx.clone());
         let codex = Codex::new(cfg.clone(), events_tx.clone());
-        (Manager { cfg, server_id, store, agents, claude, codex, bcast, events_tx, agents_dirty: false, pairing_url }, events_rx)
+        (Manager { cfg, server_id, store, agents, claude, codex, bcast, events_tx, agents_dirty: false, pairing_url, projects, cmds_tx }, events_rx)
+    }
+
+    /// Add a directory to the project registry (idempotent) and return its descriptor.
+    pub fn register_project(&mut self, path: &str) -> Value {
+        if !self.projects.iter().any(|p| p.root_path == path) {
+            self.projects.push(ProjectRecord { root_path: path.to_string(), created_at: now_iso() });
+            self.store.save_projects(&self.projects);
+            crate::log!("project added: {path}");
+        }
+        let project = crate::snapshot::project_descriptor(path);
+        self.broadcast(json!({ "type": "project.update", "payload": { "kind": "upsert", "project": project } }));
+        project
     }
 
     pub async fn run(mut self, mut cmds: mpsc::UnboundedReceiver<Cmd>, mut events: mpsc::UnboundedReceiver<ProviderEvent>, mut shutdown: oneshot::Receiver<()>) {
@@ -82,6 +108,10 @@ impl Manager {
             tokio::select! {
                 Some(cmd) = cmds.recv() => match cmd {
                     Cmd::Rpc { msg, out } => self.handle_rpc(msg, &out),
+                    Cmd::RegisterProject { path, out, mut response } => {
+                        response["payload"]["project"] = self.register_project(&path);
+                        reply(&out, response);
+                    }
                 },
                 Some(ev) = events.recv() => self.handle_event(ev),
                 _ = tick.tick() => self.housekeeping(),

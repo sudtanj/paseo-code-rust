@@ -31,7 +31,17 @@ fn server_info(ctx: &Ctx) -> Arc<str> {
             "serverId": ctx.server_id,
             "hostname": ctx.hostname,
             "version": concat!("paseo-lite-", env!("CARGO_PKG_VERSION")),
-            "features": {},
+            // The app gates screens on these flags; only list what rpc.rs implements.
+            // Add Project needs both projectAdd and stableProjectIdentity.
+            "features": {
+                "providersSnapshot": true,
+                "projectAdd": true,
+                "projectList": true,
+                "stableProjectIdentity": true,
+                "projectCreateDirectory": true,
+                "projectGithubClone": true,
+                "workspaceGithubRepositorySearch": true,
+            },
         } } })
         .to_string(),
     )

@@ -25,6 +25,11 @@ pub fn project_for(cwd: &str) -> Value {
     json!({ "projectKey": cwd, "projectName": basename(cwd), "workspaceName": basename(cwd), "checkout": checkout(cwd) })
 }
 
+/// `WorkspaceProjectDescriptorPayload`; ids match `workspace_descriptor`.
+pub fn project_descriptor(cwd: &str) -> Value {
+    json!({ "projectId": cwd, "projectKey": cwd, "projectDisplayName": basename(cwd), "projectRootPath": cwd, "projectKind": "directory" })
+}
+
 impl Agent {
     pub fn project(&self) -> Value {
         project_for(&self.rec.cwd)

@@ -1,6 +1,7 @@
 //! File-backed persistence.
 //!
 //! - `agents.json`: every agent record, rewritten atomically on change (small).
+//! - `projects.json`: directories added as projects (with or without agents).
 //! - `timelines/<agentId>.jsonl`: append-only rows. A later line with the same
 //!   `seqStart` supersedes an earlier one, so in-place row updates (merged
 //!   assistant chunks, tool-call status changes) are appends, never rewrites.
@@ -64,6 +65,13 @@ pub struct Row {
     pub timestamp: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectRecord {
+    pub root_path: String,
+    pub created_at: String,
+}
+
 pub struct Store {
     root: PathBuf,
 }
@@ -94,6 +102,27 @@ impl Store {
                 }
             }
             Err(e) => crate::warn!("failed to encode agents: {e}"),
+        }
+    }
+
+    pub fn load_projects(&self) -> Vec<ProjectRecord> {
+        match std::fs::read(self.root.join("projects.json")) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                crate::warn!("projects.json unreadable ({e}); starting empty");
+                Vec::new()
+            }),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    pub fn save_projects(&self, projects: &[ProjectRecord]) {
+        match serde_json::to_vec(projects) {
+            Ok(bytes) => {
+                if let Err(e) = crate::util::write_atomic(&self.root.join("projects.json"), &bytes, true) {
+                    crate::warn!("failed to save projects: {e}");
+                }
+            }
+            Err(e) => crate::warn!("failed to encode projects: {e}"),
         }
     }
 

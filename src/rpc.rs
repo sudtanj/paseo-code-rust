@@ -1,8 +1,8 @@
 //! Session RPC handlers for the Paseo core protocol subset.
 
-use crate::manager::{reply, Agent, Manager, Out};
+use crate::manager::{reply, wrap, Agent, Cmd, Manager, Out};
 use crate::providers::{binary_available, claude_models, is_supported, modes_for};
-use crate::snapshot::{cursor, timeline_entry, workspace_descriptor};
+use crate::snapshot::{cursor, project_descriptor, timeline_entry, workspace_descriptor};
 use crate::store::AgentRecord;
 use crate::util::{new_id, now_iso};
 use serde_json::{json, Value};
@@ -206,31 +206,24 @@ impl Manager {
                 reply(out, json!({ "type": "list_available_providers_response", "payload": { "providers": providers, "error": null, "fetchedAt": now_iso(), "requestId": rid } }));
             }
             "get_providers_snapshot_request" => {
-                let now = now_iso();
-                let entry = |provider: &str, label: &str, bin: &str, models: Value| {
-                    let ok = binary_available(bin);
-                    json!({
-                        "provider": provider,
-                        "status": if ok { "ready" } else { "unavailable" },
-                        "enabled": true,
-                        "source": "builtin",
-                        "label": label,
-                        "models": models,
-                        "modes": modes_for(provider),
-                        "defaultModeId": crate::providers::default_mode(provider),
-                        "fetchedAt": now,
-                    })
-                };
-                let codex_models = json!([{ "provider": "codex", "id": "default", "label": "Default", "isDefault": true }]);
-                let entries = json!([
-                    entry("claude", "Claude Code", &self.cfg.claude_bin, claude_models()),
-                    entry("codex", "Codex", &self.cfg.codex_bin, codex_models),
-                ]);
-                let mut payload = json!({ "entries": entries, "generatedAt": now, "requestId": rid });
+                // Answer right away with whatever models are known; a cold Codex
+                // model list (app-server start + gateway call) can take longer
+                // than the app waits, so it is fetched in the background and
+                // pushed as `providers_snapshot_update`.
+                let cached = self.codex.cached_models();
+                let mut payload = json!({ "entries": self.provider_entries(cached.clone()), "generatedAt": now_iso(), "requestId": rid });
                 if let Some(cwd) = s(&msg, "cwd") {
                     payload["cwd"] = json!(cwd);
                 }
                 reply(out, json!({ "type": "get_providers_snapshot_response", "payload": payload }));
+                if cached.is_none() {
+                    self.push_codex_models();
+                }
+            }
+            "refresh_providers_snapshot_request" => {
+                reply(out, json!({ "type": "refresh_providers_snapshot_response", "payload": { "requestId": rid, "acknowledged": true } }));
+                self.codex.clear_models();
+                self.push_codex_models();
             }
             "fetch_workspaces_request" => {
                 let mut by_cwd: BTreeMap<String, Vec<&Agent>> = BTreeMap::new();
@@ -238,7 +231,65 @@ impl Manager {
                     by_cwd.entry(a.rec.cwd.clone()).or_default().push(a);
                 }
                 let entries: Vec<Value> = by_cwd.iter().map(|(cwd, agents)| workspace_descriptor(cwd, agents)).collect();
-                reply(out, json!({ "type": "fetch_workspaces_response", "payload": { "requestId": rid, "entries": entries, "emptyProjects": [], "pageInfo": { "nextCursor": null, "prevCursor": null, "hasMore": false } } }));
+                let empty: Vec<Value> = self.projects.iter().filter(|p| !by_cwd.contains_key(&p.root_path)).map(|p| project_descriptor(&p.root_path)).collect();
+                reply(out, json!({ "type": "fetch_workspaces_response", "payload": { "requestId": rid, "entries": entries, "emptyProjects": empty, "pageInfo": { "nextCursor": null, "prevCursor": null, "hasMore": false } } }));
+            }
+            "project.list.request" => {
+                let mut paths: Vec<String> = self.projects.iter().map(|p| p.root_path.clone()).collect();
+                for a in self.agents.values().filter(|a| a.rec.archived_at.is_none()) {
+                    if !paths.contains(&a.rec.cwd) {
+                        paths.push(a.rec.cwd.clone());
+                    }
+                }
+                let projects: Vec<Value> = paths.iter().map(|p| project_descriptor(p)).collect();
+                reply(out, json!({ "type": "project.list.response", "payload": { "requestId": rid, "projects": projects } }));
+            }
+            "project.add.request" => {
+                let requested = s(&msg, "cwd").unwrap_or_default();
+                let payload = match normalize_dir(&requested) {
+                    Ok(cwd) => json!({ "requestId": rid, "project": self.register_project(&cwd), "error": null }),
+                    Err(e) => json!({ "requestId": rid, "project": null, "error": format!("Directory not found: {e}"), "errorCode": "directory_not_found" }),
+                };
+                reply(out, json!({ "type": "project.add.response", "payload": payload }));
+            }
+            "project.create_directory.request" => {
+                let parent = s(&msg, "parentPath").unwrap_or_default();
+                let name = s(&msg, "name").unwrap_or_default();
+                let payload = match crate::projects::create_directory(&parent, &name) {
+                    Ok(path) => json!({ "requestId": rid, "directoryPath": path, "project": self.register_project(&path), "error": null, "errorCode": null }),
+                    Err((code, error)) => json!({ "requestId": rid, "directoryPath": null, "project": null, "error": error, "errorCode": code }),
+                };
+                reply(out, json!({ "type": "project.create_directory.response", "payload": payload }));
+            }
+            "workspace.github.search_repositories.request" => {
+                let query = s(&msg, "query").unwrap_or_default();
+                let limit = msg.get("limit").and_then(|v| v.as_u64()).unwrap_or(20).clamp(1, 50);
+                let out = out.clone();
+                let rid = rid.clone();
+                tokio::spawn(async move {
+                    let payload = crate::projects::search_repositories(&query, limit, &rid).await;
+                    reply(&out, json!({ "type": "workspace.github.search_repositories.response", "payload": payload }));
+                });
+            }
+            "project.github.clone.request" => {
+                let repo = s(&msg, "repo").unwrap_or_default();
+                let protocol = s(&msg, "cloneProtocol").unwrap_or_else(|| "https".into());
+                let target = expand_home(s(&msg, "targetDirectory").unwrap_or_default().trim());
+                let out = out.clone();
+                let cmds = self.cmds_tx.clone();
+                let rid = rid.clone();
+                tokio::spawn(async move {
+                    match crate::projects::clone_repository(&repo, &protocol, &target).await {
+                        Ok((display, path)) => {
+                            let response = json!({ "type": "project.github.clone.response", "payload": { "requestId": rid, "repo": display, "checkoutPath": path, "project": null, "error": null } });
+                            let _ = cmds.send(Cmd::RegisterProject { path, out, response });
+                        }
+                        Err((display, path, error)) => {
+                            crate::warn!("github clone of {repo} failed: {error}");
+                            reply(&out, json!({ "type": "project.github.clone.response", "payload": { "requestId": rid, "repo": display, "checkoutPath": path, "project": null, "error": error } }));
+                        }
+                    }
+                });
             }
             "directory_suggestions_request" => {
                 let query = s(&msg, "query").unwrap_or_default();
@@ -272,6 +323,30 @@ impl Manager {
                 }
             }
         }
+    }
+
+    fn provider_entries(&self, codex_models: Option<Value>) -> Value {
+        provider_entries(&self.cfg.claude_bin, &self.cfg.codex_bin, codex_models)
+    }
+
+    /// Fetch the Codex model list in the background and push it to every session.
+    fn push_codex_models(&self) {
+        if !binary_available(&self.cfg.codex_bin) {
+            return;
+        }
+        let codex = self.codex.clone();
+        let bcast = self.bcast.clone();
+        let (claude_bin, codex_bin) = (self.cfg.claude_bin.clone(), self.cfg.codex_bin.clone());
+        tokio::spawn(async move {
+            match codex.list_models().await {
+                Ok(models) if models.as_array().map(|m| !m.is_empty()).unwrap_or(false) => {
+                    let entries = provider_entries(&claude_bin, &codex_bin, Some(models));
+                    let _ = bcast.send(wrap(json!({ "type": "providers_snapshot_update", "payload": { "entries": entries, "generatedAt": now_iso() } })));
+                }
+                Ok(_) => crate::warn!("codex returned no models; keeping the default entry"),
+                Err(e) => crate::warn!("codex model list failed: {e}"),
+            }
+        });
     }
 
     fn create_agent(&mut self, msg: &Value, rid: &str, out: &Out) {
@@ -379,6 +454,31 @@ impl Manager {
         });
         reply(out, json!({ "type": "fetch_agent_timeline_response", "payload": payload }));
     }
+}
+
+/// `ProviderSnapshotEntry` list. Codex falls back to a single "Default" model
+/// (Codex's configured model) until its real list has been fetched.
+fn provider_entries(claude_bin: &str, codex_bin: &str, codex_models: Option<Value>) -> Value {
+    let now = now_iso();
+    let entry = |provider: &str, label: &str, bin: &str, models: Value| {
+        let ok = binary_available(bin);
+        json!({
+            "provider": provider,
+            "status": if ok { "ready" } else { "unavailable" },
+            "enabled": true,
+            "source": "builtin",
+            "label": label,
+            "models": models,
+            "modes": modes_for(provider),
+            "defaultModeId": crate::providers::default_mode(provider),
+            "fetchedAt": now,
+        })
+    };
+    let codex_models = codex_models.unwrap_or_else(|| json!([{ "provider": "codex", "id": "default", "label": "Default", "isDefault": true }]));
+    crate::snapshot::clean(json!([
+        entry("claude", "Claude Code", claude_bin, claude_models()),
+        entry("codex", "Codex", codex_bin, codex_models),
+    ]))
 }
 
 pub fn rpc_error(out: &Out, request_id: &str, request_type: &str, error: &str) {

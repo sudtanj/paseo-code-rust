@@ -292,6 +292,16 @@ impl Codex {
         Ok(models)
     }
 
+    /// The model list from an earlier `list_models`, without starting anything.
+    pub fn cached_models(&self) -> Option<Value> {
+        self.inner.state.lock().unwrap().models.clone()
+    }
+
+    /// Drop the cached model list so the next `list_models` asks the app-server again.
+    pub fn clear_models(&self) {
+        self.inner.state.lock().unwrap().models = None;
+    }
+
     fn kill(&self) {
         let mut st = self.inner.state.lock().unwrap();
         if let Some(mut p) = st.proc.take() {
