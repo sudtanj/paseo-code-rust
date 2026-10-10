@@ -64,10 +64,10 @@ on a 1 GB VM is slow.
 ## Run
 
 ```sh
-paseo-lite                    # 127.0.0.1:6767 + relay; prints a pairing QR/link
+paseo-lite                    # 127.0.0.1:6768 + relay; prints a pairing QR/link
 paseo-lite --no-relay         # direct connections only (LAN/Tailscale/SSH tunnel)
 paseo-lite pair               # print the pairing link again
-PASEO_LISTEN=0.0.0.0:6767 PASEO_PASSWORD=secret paseo-lite
+PASEO_LISTEN=0.0.0.0:6768 PASEO_PASSWORD=secret paseo-lite
 ```
 
 `claude` and/or `codex` must be on `PATH` and already logged in. To use other binaries, set
@@ -76,7 +76,7 @@ PASEO_LISTEN=0.0.0.0:6767 PASEO_PASSWORD=secret paseo-lite
 | Variable | Default | Meaning |
 |---|---|---|
 | `PASEO_LITE_HOME` | `~/.paseo-lite` | state: agents, timelines, server id, keypair |
-| `PASEO_LISTEN` | `127.0.0.1:6767` | HTTP/WS listen address |
+| `PASEO_LISTEN` | `127.0.0.1:6768` | HTTP/WS listen address |
 | `PASEO_PASSWORD` | – | required for direct (non-relay) clients |
 | `PASEO_RELAY_ENABLED` (alias `PASEO_RELAY`) | `true` | enable the outbound relay |
 | `PASEO_HOSTNAMES` | – | comma-separated extra Host names for direct connections (`paseo.example.com,.lan`); IPs and localhost always allowed, others get `403 Host not allowed` |

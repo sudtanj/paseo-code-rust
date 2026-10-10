@@ -47,7 +47,7 @@ impl Config {
             let base = env("HOME").unwrap_or_else(|| ".".into());
             PathBuf::from(base).join(".paseo-lite")
         });
-        let mut listen = env("PASEO_LISTEN").unwrap_or_else(|| "127.0.0.1:6767".into());
+        let mut listen = env("PASEO_LISTEN").unwrap_or_else(|| "127.0.0.1:6768".into());
         let mut relay_enabled = env_bool("PASEO_RELAY_ENABLED").or_else(|| env_bool("PASEO_RELAY")).unwrap_or(true);
         let mut i = 0;
         while i < args.len() {

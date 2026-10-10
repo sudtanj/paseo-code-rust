@@ -22,7 +22,7 @@ USAGE:
 
 ENVIRONMENT (selection):
     PASEO_LITE_HOME          state dir (default ~/.paseo-lite)
-    PASEO_LISTEN             default 127.0.0.1:6767
+    PASEO_LISTEN             default 127.0.0.1:6768
     PASEO_PASSWORD           require this password for direct connections
     PASEO_RELAY_ENABLED=false  disable the relay
     PASEO_HOSTNAMES          extra allowed Host names (comma separated, .suffix ok)
