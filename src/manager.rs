@@ -72,7 +72,7 @@ impl Manager {
         crate::log!("loaded {} agents", agents.len());
         let claude = ClaudePool::new(cfg.clone(), events_tx.clone());
         let codex = Codex::new(cfg.clone(), events_tx.clone());
-        (Manager { cfg, server_id, store, agents, claude, codex, bcast, events_tx, agents_dirty: false }, events_rx)
+        (Manager { cfg, server_id, store, agents, claude, codex, bcast, events_tx, agents_dirty: false, pairing_url }, events_rx)
     }
 
     pub async fn run(mut self, mut cmds: mpsc::UnboundedReceiver<Cmd>, mut events: mpsc::UnboundedReceiver<ProviderEvent>, mut shutdown: oneshot::Receiver<()>) {
