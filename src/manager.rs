@@ -261,7 +261,11 @@ impl Manager {
             model: a.rec.model.clone(),
             mode_id: a.rec.mode_id.clone(),
             session_id: a.rec.session_id.clone(),
-            system_prompt: a.rec.system_prompt.clone(),
+            system_prompt: match (self.cfg.default_system_prompt.as_deref(), a.rec.system_prompt.as_deref().filter(|p| !p.trim().is_empty())) {
+                (Some(d), Some(own)) => Some(format!("{d}\n\n{own}")),
+                (Some(d), None) => Some(d.to_string()),
+                (None, own) => own.map(String::from),
+            },
         })
     }
 

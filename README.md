@@ -89,6 +89,7 @@ PASEO_LISTEN=0.0.0.0:6768 PASEO_PASSWORD=secret paseo-lite
 | `PASEO_CLAUDE_IDLE_SECS` | `90` | keep-warm time after a Claude turn |
 | `PASEO_CODEX_IDLE_SECS` | `300` | idle time before the shared app-server exits |
 | `PASEO_TIMELINE_UNLOAD_SECS` | `600` | drop idle timelines from memory |
+| `PASEO_DEFAULT_SYSTEM_PROMPT` | built-in low-resource note | instructions added to every agent (Claude `--append-system-prompt`, Codex `developerInstructions`); the default tells agents not to run, serve or test the app locally on a small VM. Set to an empty string to disable |
 
 A systemd unit is in `contrib/paseo-lite.service`.
 

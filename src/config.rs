@@ -3,6 +3,11 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// Appended to every agent's system prompt (Claude `--append-system-prompt`,
+/// Codex `developerInstructions`). paseo-lite targets small VMs where an agent
+/// starting dev servers, test suites or builds can starve or OOM the host.
+pub const DEFAULT_SYSTEM_PROMPT: &str = "You are running on a low-resource VM (for example a 1 GB RAM free-tier instance) that is shared with the agent daemon itself. Do not run, start, or serve the application you are developing locally (no dev servers, `npm run dev`/`start`, `cargo run`, `docker compose up`, emulators or browsers), and do not run its test suites, end-to-end tests, benchmarks or full builds locally - they can exhaust the machine's memory and CPU and take it down. Verify changes by careful code reading and reasoning instead, and rely on CI or the user to build and test. Lightweight commands such as git, file inspection, searching, formatting or a single quick syntax check are fine. If verification genuinely requires running something heavy, stop and ask the user first.";
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub home: PathBuf,
@@ -27,6 +32,9 @@ pub struct Config {
     pub codex_idle: Duration,
     /// Timelines of agents untouched for this long are dropped from memory.
     pub timeline_unload: Duration,
+    /// Instructions added to every agent; `PASEO_DEFAULT_SYSTEM_PROMPT` overrides
+    /// it, and setting it to an empty string disables it.
+    pub default_system_prompt: Option<String>,
 }
 
 fn env(key: &str) -> Option<String> {
@@ -85,6 +93,11 @@ impl Config {
             claude_max_live: env("PASEO_CLAUDE_MAX_LIVE").and_then(|v| v.parse().ok()).unwrap_or(3).max(1),
             codex_idle: env_secs("PASEO_CODEX_IDLE_SECS", 300),
             timeline_unload: env_secs("PASEO_TIMELINE_UNLOAD_SECS", 600),
+            default_system_prompt: match std::env::var("PASEO_DEFAULT_SYSTEM_PROMPT") {
+                Ok(v) if v.trim().is_empty() => None,
+                Ok(v) => Some(v),
+                Err(_) => Some(DEFAULT_SYSTEM_PROMPT.to_string()),
+            },
         }
     }
 }

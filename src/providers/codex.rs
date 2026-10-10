@@ -235,6 +235,10 @@ impl Codex {
             "approvalPolicy": approval,
             "sandboxPolicy": sandbox_policy,
         });
+        // Per turn too, so threads created before the instructions existed get them.
+        if let Some(p) = spec.system_prompt.as_deref().filter(|p| !p.is_empty()) {
+            params["developerInstructions"] = json!(p);
+        }
         if let Some(m) = &model {
             params["model"] = json!(m);
         }
