@@ -77,7 +77,7 @@ pub fn create_directory(parent: &str, name: &str) -> Result<String, (String, Str
     }
 }
 
-async fn run(program: &str, args: &[&str], cwd: Option<&Path>, timeout: Duration) -> Result<String, String> {
+pub(crate) async fn run(program: &str, args: &[&str], cwd: Option<&Path>, timeout: Duration) -> Result<String, String> {
     let mut cmd = Command::new(program);
     cmd.args(args).kill_on_drop(true).stdin(std::process::Stdio::null());
     if let Some(dir) = cwd {

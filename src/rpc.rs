@@ -298,6 +298,33 @@ impl Manager {
                 let entries: Vec<Value> = dirs.iter().map(|d| json!({ "path": d, "kind": "directory" })).collect();
                 reply(out, json!({ "type": "directory_suggestions_response", "payload": { "directories": dirs, "entries": entries, "error": null, "requestId": rid } }));
             }
+            "file_explorer_request" => {
+                reply(out, json!({ "type": "file_explorer_response", "payload": crate::files::explore(&msg, &rid) }));
+            }
+            "checkout_status_request" => {
+                let (out, rid, cwd) = (out.clone(), rid.clone(), s(&msg, "cwd").unwrap_or_default());
+                tokio::spawn(async move {
+                    reply(&out, json!({ "type": "checkout_status_response", "payload": crate::checkout::status(&cwd, &rid).await }));
+                });
+            }
+            "checkout.diff.get.request" => {
+                let (out, rid, cwd) = (out.clone(), rid.clone(), s(&msg, "cwd").unwrap_or_default());
+                let compare = msg.get("compare").cloned().unwrap_or_else(|| json!({ "mode": "uncommitted" }));
+                tokio::spawn(async move {
+                    reply(&out, json!({ "type": "checkout.diff.get.response", "payload": crate::checkout::get(&cwd, &compare, &rid).await }));
+                });
+            }
+            "subscribe_checkout_diff_request" => {
+                let sub_id = s(&msg, "subscriptionId").unwrap_or_else(new_id);
+                let compare = msg.get("compare").cloned().unwrap_or_else(|| json!({ "mode": "uncommitted" }));
+                let cwd = s(&msg, "cwd").unwrap_or_default();
+                tokio::spawn(crate::checkout::subscribe(self.checkout.clone(), out.clone(), rid.clone(), sub_id, cwd, compare));
+            }
+            "unsubscribe_checkout_diff_request" => {
+                if let Some(id) = s(&msg, "subscriptionId") {
+                    self.checkout.unsubscribe(&id);
+                }
+            }
             "daemon.get_pairing_offer.request" => {
                 let (url, qr) = match &self.pairing_url {
                     Some(u) => {

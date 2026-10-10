@@ -58,6 +58,8 @@ pub struct Manager {
     pub projects: Vec<ProjectRecord>,
     /// Lets background tasks hand results back to the manager.
     pub cmds_tx: mpsc::UnboundedSender<Cmd>,
+    /// Live git diff subscriptions for the Changes panel.
+    pub checkout: crate::checkout::Watcher,
 }
 
 pub fn wrap(msg: Value) -> Arc<str> {
@@ -86,7 +88,7 @@ impl Manager {
         crate::log!("loaded {} agents, {} projects", agents.len(), projects.len());
         let claude = ClaudePool::new(cfg.clone(), events_tx.clone());
         let codex = Codex::new(cfg.clone(), events_tx.clone());
-        (Manager { cfg, server_id, store, agents, claude, codex, bcast, events_tx, agents_dirty: false, pairing_url, projects, cmds_tx }, events_rx)
+        (Manager { cfg, server_id, store, agents, claude, codex, bcast, events_tx, agents_dirty: false, pairing_url, projects, cmds_tx, checkout: crate::checkout::Watcher::start() }, events_rx)
     }
 
     /// Add a directory to the project registry (idempotent) and return its descriptor.
@@ -365,6 +367,7 @@ impl Manager {
         }
         self.touch(agent_id);
         self.publish_agent(agent_id);
+        self.checkout.poke();
 
         if provider == "claude" {
             for (spec, text) in self.claude.turn_finished(agent_id) {

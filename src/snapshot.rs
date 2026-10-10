@@ -18,7 +18,15 @@ pub fn workspace_id(cwd: &str) -> String {
 }
 
 pub fn checkout(cwd: &str) -> Value {
-    json!({ "cwd": cwd, "isGit": false, "currentBranch": null, "remoteUrl": null, "worktreeRoot": null, "isPaseoOwnedWorktree": false, "mainRepoRoot": null })
+    match crate::checkout::probe(cwd) {
+        // Git variant of ProjectCheckoutLite; remoteUrl stays null to avoid a git spawn per snapshot.
+        Some((root, branch)) => json!({ "cwd": cwd, "isGit": true, "currentBranch": branch, "remoteUrl": null, "worktreeRoot": root.to_string_lossy(), "isPaseoOwnedWorktree": false, "mainRepoRoot": null }),
+        None => json!({ "cwd": cwd, "isGit": false, "currentBranch": null, "remoteUrl": null, "worktreeRoot": null, "isPaseoOwnedWorktree": false, "mainRepoRoot": null }),
+    }
+}
+
+fn project_kind(cwd: &str) -> &'static str {
+    if crate::checkout::probe(cwd).is_some() { "git" } else { "directory" }
 }
 
 pub fn project_for(cwd: &str) -> Value {
@@ -27,7 +35,7 @@ pub fn project_for(cwd: &str) -> Value {
 
 /// `WorkspaceProjectDescriptorPayload`; ids match `workspace_descriptor`.
 pub fn project_descriptor(cwd: &str) -> Value {
-    json!({ "projectId": cwd, "projectKey": cwd, "projectDisplayName": basename(cwd), "projectRootPath": cwd, "projectKind": "directory" })
+    json!({ "projectId": cwd, "projectKey": cwd, "projectDisplayName": basename(cwd), "projectRootPath": cwd, "projectKind": project_kind(cwd) })
 }
 
 impl Agent {
@@ -142,15 +150,15 @@ pub fn workspace_descriptor(cwd: &str, agents: &[&Agent]) -> Value {
         "projectDisplayName": basename(cwd),
         "projectRootPath": cwd,
         "workspaceDirectory": cwd,
-        "projectKind": "directory",
-        "workspaceKind": "directory",
+        "projectKind": project_kind(cwd),
+        "workspaceKind": if project_kind(cwd) == "git" { "local_checkout" } else { "directory" },
         "name": basename(cwd),
         "archivingAt": null,
         "status": status,
         "statusEnteredAt": null,
         "activityAt": activity,
         "scripts": [],
-        "gitRuntime": null,
+        "gitRuntime": crate::checkout::probe(cwd).map(|(_, branch)| json!({ "currentBranch": branch, "isPaseoOwnedWorktree": false })),
         "githubRuntime": null,
         "project": project_for(cwd),
     })

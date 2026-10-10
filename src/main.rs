@@ -1,5 +1,7 @@
+mod checkout;
 mod config;
 mod e2ee;
+mod files;
 mod manager;
 mod projects;
 mod providers;
