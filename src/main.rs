@@ -35,7 +35,7 @@ ENVIRONMENT (selection):
     PASEO_CLAUDE_MAX_LIVE    max concurrent claude processes (default 3)
     PASEO_CLAUDE_IDLE_SECS   keep-warm time for an idle claude process (default 90)
     PASEO_CODEX_IDLE_SECS    idle time before the shared codex app-server exits (default 300)
-    PASEO_DEFAULT_SYSTEM_PROMPT  instructions for every agent (default: do not run/test the app locally; "" disables)
+    PASEO_DEFAULT_SYSTEM_PROMPT  instructions for every agent (default: do not run/test the app locally; set empty to disable)
 ";
 
 fn hostname() -> String {
