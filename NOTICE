@@ -1,0 +1,5 @@
+paseo-lite
+Derived from Paseo (https://github.com/getpaseo/paseo),
+Copyright (c) 2025-present Mohamed Boudra, licensed under the Apache License 2.0.
+The relay transport, E2EE channel and wire protocol shapes are ports of Paseo's
+@getpaseo/relay and @getpaseo/protocol packages. See LICENSE.

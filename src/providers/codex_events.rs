@@ -1,0 +1,154 @@
+//! Codex app-server notifications and server->client requests (approvals).
+
+use super::{s, Codex};
+use crate::providers::{tools, ProviderEvent};
+use serde_json::{json, Value};
+use tokio::sync::oneshot;
+
+impl Codex {
+    pub(super) fn handle_notification(&self, method: &str, params: &Value) {
+        let Some(agent_id) = self.agent_for(params) else { return };
+        match method {
+            "turn/started" => {
+                let turn_id = params.get("turn").and_then(|t| s(t, "id"));
+                if let Some(entry) = self.inner.state.lock().unwrap().active.get_mut(&agent_id) {
+                    entry.1 = turn_id.clone();
+                }
+                self.emit(ProviderEvent::TurnStarted { agent_id, turn_id });
+            }
+            "item/agentMessage/delta" | "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
+                let Some(delta) = s(params, "delta").filter(|d| !d.is_empty()) else { return };
+                if let Some(item_id) = s(params, "itemId") {
+                    self.inner.state.lock().unwrap().streamed_items.insert(item_id);
+                }
+                let kind = if method == "item/agentMessage/delta" { "assistant_message" } else { "reasoning" };
+                self.emit(ProviderEvent::Timeline { agent_id, item: json!({ "type": kind, "text": delta }) });
+            }
+            "item/started" | "item/completed" => {
+                let Some(item) = params.get("item") else { return };
+                let completed = method == "item/completed";
+                let item_id = s(item, "id").unwrap_or_default();
+                match item.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                    "agentMessage" | "reasoning" if completed => {
+                        let was_streamed = self.inner.state.lock().unwrap().streamed_items.remove(&item_id);
+                        if was_streamed {
+                            return;
+                        }
+                        let (kind, text) = if item.get("type").and_then(|t| t.as_str()) == Some("agentMessage") {
+                            ("assistant_message", s(item, "text").unwrap_or_default())
+                        } else {
+                            let join = |k: &str| item.get(k).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join("\n")).unwrap_or_default();
+                            let summary = join("summary");
+                            ("reasoning", if summary.is_empty() { join("content") } else { summary })
+                        };
+                        if !text.is_empty() {
+                            self.emit(ProviderEvent::Timeline { agent_id, item: json!({ "type": kind, "text": text }) });
+                        }
+                    }
+                    "contextCompaction" if completed => {
+                        self.emit(ProviderEvent::Timeline { agent_id, item: json!({ "type": "compaction", "status": "completed" }) });
+                    }
+                    _ => {
+                        if let Some(tool) = tools::codex_tool_item(item, completed) {
+                            self.emit(ProviderEvent::Timeline { agent_id, item: tool });
+                        }
+                    }
+                }
+            }
+            "turn/plan/updated" => {
+                let Some(plan) = params.get("plan").and_then(|p| p.as_array()) else { return };
+                let items: Vec<Value> = plan
+                    .iter()
+                    .map(|p| {
+                        let status = match s(p, "status").as_deref() {
+                            Some("completed") => "completed",
+                            Some("inProgress") | Some("in_progress") => "in_progress",
+                            _ => "pending",
+                        };
+                        json!({ "text": s(p, "step").unwrap_or_default(), "completed": status == "completed", "status": status })
+                    })
+                    .collect();
+                self.emit(ProviderEvent::Timeline { agent_id, item: json!({ "type": "todo", "items": items }) });
+            }
+            "thread/tokenUsage/updated" => {
+                let usage = params.get("tokenUsage").or_else(|| params.get("usage")).cloned().unwrap_or(Value::Null);
+                let total = usage.get("total").unwrap_or(&usage);
+                let pick = |k: &str| total.get(k).cloned().unwrap_or(Value::Null);
+                let usage = json!({
+                    "inputTokens": pick("inputTokens"),
+                    "cachedInputTokens": pick("cachedInputTokens"),
+                    "outputTokens": pick("outputTokens"),
+                    "contextWindowMaxTokens": usage.get("modelContextWindow").cloned().unwrap_or(Value::Null),
+                });
+                self.emit(ProviderEvent::Usage { agent_id, usage });
+            }
+            "turn/completed" => {
+                let turn = params.get("turn").cloned().unwrap_or(Value::Null);
+                self.inner.state.lock().unwrap().active.remove(&agent_id);
+                match s(&turn, "status").as_deref() {
+                    Some("failed") => {
+                        let error = turn.get("error").and_then(|e| s(e, "message")).unwrap_or_else(|| "turn failed".into());
+                        self.emit(ProviderEvent::TurnFailed { agent_id, error });
+                    }
+                    Some("interrupted") => self.emit(ProviderEvent::TurnCanceled { agent_id, reason: "interrupted".into() }),
+                    _ => self.emit(ProviderEvent::TurnCompleted { agent_id }),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn handle_server_request(&self, id: Value, method: &str, params: Value) {
+        let is_approval = matches!(
+            method,
+            "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" | "execCommandApproval" | "applyPatchApproval"
+        );
+        let agent_id = self.agent_for(&params);
+        let (true, Some(agent_id)) = (is_approval, agent_id) else {
+            self.send_raw(json!({ "id": id, "error": { "code": -32601, "message": format!("{method} is not supported by paseo-lite") } }));
+            return;
+        };
+        let legacy = !method.starts_with("item/");
+        let is_command = method.contains("ommand") || method == "execCommandApproval";
+        let command = match params.get("command") {
+            Some(Value::Array(parts)) => parts.iter().filter_map(|p| p.as_str()).collect::<Vec<_>>().join(" "),
+            Some(Value::String(c)) => c.clone(),
+            _ => String::new(),
+        };
+        let (name, detail) = if is_command {
+            ("shell", json!({ "type": "shell", "command": command, "cwd": s(&params, "cwd") }))
+        } else {
+            ("apply_patch", json!({ "type": "plain_text", "label": "Apply file changes", "text": s(&params, "reason").unwrap_or_default() }))
+        };
+        let request = json!({
+            "id": format!("perm-{}", crate::util::new_id()),
+            "provider": "codex",
+            "name": name,
+            "kind": "tool",
+            "title": if is_command { "Run command" } else { "Edit files" },
+            "description": s(&params, "reason"),
+            "input": params,
+            "detail": detail,
+        });
+        let (tx, rx) = oneshot::channel::<Value>();
+        self.inner.state.lock().unwrap().open_approvals += 1;
+        self.emit(ProviderEvent::Permission { agent_id, request, reply: tx });
+        let this = self.clone();
+        tokio::spawn(async move {
+            let answer = rx.await.unwrap_or_else(|_| json!({ "behavior": "deny", "interrupt": true }));
+            let allow = answer.get("behavior").and_then(|b| b.as_str()) == Some("allow");
+            let interrupt = answer.get("interrupt").and_then(|i| i.as_bool()).unwrap_or(false);
+            let decision = match (legacy, allow, interrupt) {
+                (true, true, _) => "approved",
+                (true, false, true) => "abort",
+                (true, false, false) => "denied",
+                (false, true, _) => "accept",
+                (false, false, true) => "cancel",
+                (false, false, false) => "decline",
+            };
+            this.send_raw(json!({ "id": id, "result": { "decision": decision } }));
+            let mut st = this.inner.state.lock().unwrap();
+            st.open_approvals = st.open_approvals.saturating_sub(1);
+        });
+    }
+}

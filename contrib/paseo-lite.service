@@ -1,0 +1,16 @@
+[Unit]
+Description=paseo-lite agent daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/paseo-lite
+Restart=on-failure
+RestartSec=3
+# Keep the daemon itself small on tiny VMs; agent children are not limited here.
+MemoryHigh=64M
+Nice=5
+
+[Install]
+WantedBy=default.target
