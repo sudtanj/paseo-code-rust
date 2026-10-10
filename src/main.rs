@@ -12,6 +12,7 @@ mod session;
 mod snapshot;
 mod store;
 mod util;
+mod workspaces;
 
 use config::Config;
 use std::sync::Arc;

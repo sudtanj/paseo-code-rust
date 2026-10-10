@@ -2,6 +2,7 @@
 //!
 //! - `agents.json`: every agent record, rewritten atomically on change (small).
 //! - `projects.json`: directories added as projects (with or without agents).
+//! - `workspaces.json`: workspaces (a project directory agents are grouped under).
 //! - `timelines/<agentId>.jsonl`: append-only rows. A later line with the same
 //!   `seqStart` supersedes an earlier one, so in-place row updates (merged
 //!   assistant chunks, tool-call status changes) are appends, never rewrites.
@@ -19,6 +20,9 @@ pub struct AgentRecord {
     pub id: String,
     pub provider: String,
     pub cwd: String,
+    /// Workspace this agent belongs to (assigned on load for older records).
+    #[serde(default)]
+    pub workspace_id: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -72,6 +76,24 @@ pub struct ProjectRecord {
     pub created_at: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceRecord {
+    pub id: String,
+    /// Project id (the project root path, as everywhere else in paseo-lite).
+    pub project_id: String,
+    pub project_root: String,
+    /// Directory agents in this workspace run in.
+    pub directory: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub pinned_at: Option<String>,
+    pub created_at: String,
+    #[serde(default)]
+    pub archived_at: Option<String>,
+}
+
 pub struct Store {
     root: PathBuf,
 }
@@ -102,6 +124,27 @@ impl Store {
                 }
             }
             Err(e) => crate::warn!("failed to encode agents: {e}"),
+        }
+    }
+
+    pub fn load_workspaces(&self) -> Vec<WorkspaceRecord> {
+        match std::fs::read(self.root.join("workspaces.json")) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                crate::warn!("workspaces.json unreadable ({e}); starting empty");
+                Vec::new()
+            }),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    pub fn save_workspaces(&self, workspaces: &[WorkspaceRecord]) {
+        match serde_json::to_vec(workspaces) {
+            Ok(bytes) => {
+                if let Err(e) = crate::util::write_atomic(&self.root.join("workspaces.json"), &bytes, true) {
+                    crate::warn!("failed to save workspaces: {e}");
+                }
+            }
+            Err(e) => crate::warn!("failed to encode workspaces: {e}"),
         }
     }
 

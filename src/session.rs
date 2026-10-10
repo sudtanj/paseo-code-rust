@@ -35,6 +35,8 @@ fn server_info(ctx: &Ctx) -> Arc<str> {
             // Add Project needs both projectAdd and stableProjectIdentity.
             "features": {
                 "providersSnapshot": true,
+                "workspaceMultiplicity": true,
+                "workspacePinning": true,
                 "projectAdd": true,
                 "projectList": true,
                 "stableProjectIdentity": true,

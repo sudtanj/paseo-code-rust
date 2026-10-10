@@ -62,13 +62,43 @@ pub fn modes_for(provider: &str) -> Value {
     if provider == "codex" { codex_modes() } else { claude_modes() }
 }
 
+/// Claude Code model catalog, ported from upstream's curated manifest
+/// (providers/claude/model-manifest.ts). Upstream verifies it with a probe
+/// process; paseo-lite skips the probe to avoid spawning `claude` just to
+/// list models. Mythos 5.1 is omitted because upstream only shows it after
+/// discovery confirms access.
 pub fn claude_models() -> Value {
-    serde_json::json!([
-        { "provider": "claude", "id": "default", "label": "Default", "isDefault": true },
-        { "provider": "claude", "id": "opus", "label": "Opus" },
-        { "provider": "claude", "id": "sonnet", "label": "Sonnet" },
-        { "provider": "claude", "id": "haiku", "label": "Haiku" }
-    ])
+    const MODELS: &[(&str, &str, &str, u64)] = &[
+        ("claude-opus-5-5", "Opus 5.5", "Opus 5.5 · Latest release", 1_000_000),
+        ("claude-opus-5", "Opus 5", "Opus 5 · Previous release", 1_000_000),
+        ("claude-fable-5-1", "Fable 5.1", "Fable 5.1 · Most powerful model", 1_000_000),
+        ("claude-fable-5", "Fable 5", "Fable 5 · Previous release", 1_000_000),
+        ("claude-opus-4-8[1m]", "Opus 4.8 1M", "Opus 4.8 with 1M context window", 1_000_000),
+        ("claude-opus-4-8", "Opus 4.8", "Opus 4.8 · Previous release", 200_000),
+        ("claude-sonnet-5-5", "Sonnet 5.5", "Sonnet 5.5 · Best for everyday tasks", 1_000_000),
+        ("claude-sonnet-5", "Sonnet 5", "Sonnet 5 · Previous release", 200_000),
+        ("claude-sonnet-5[1m]", "Sonnet 5 1M", "Sonnet 5 with 1M context window", 1_000_000),
+        ("claude-opus-4-7[1m]", "Opus 4.7 1M", "Opus 4.7 with 1M context window", 1_000_000),
+        ("claude-opus-4-7", "Opus 4.7", "Opus 4.7 · Previous release", 200_000),
+        ("claude-opus-4-6[1m]", "Opus 4.6 1M", "Opus 4.6 with 1M context window", 1_000_000),
+        ("claude-opus-4-6", "Opus 4.6", "Opus 4.6 · Most capable for complex work", 200_000),
+        ("claude-sonnet-4-6[1m]", "Sonnet 4.6 1M", "Sonnet 4.6 with 1M context window", 1_000_000),
+        ("claude-sonnet-4-6", "Sonnet 4.6", "Sonnet 4.6 · Best for everyday tasks", 200_000),
+        ("claude-haiku-5-5", "Haiku 5.5", "Haiku 5.5 · Fastest for quick answers", 1_000_000),
+        ("claude-haiku-4-5", "Haiku 4.5", "Haiku 4.5 · Previous release", 200_000),
+    ];
+    Value::Array(
+        MODELS
+            .iter()
+            .map(|(id, label, description, context)| {
+                let mut m = serde_json::json!({ "provider": "claude", "id": id, "label": label, "description": description, "contextWindowMaxTokens": context });
+                if *id == "claude-opus-5-5" {
+                    m["isDefault"] = serde_json::json!(true);
+                }
+                m
+            })
+            .collect(),
+    )
 }
 
 pub fn is_supported(provider: &str) -> bool {

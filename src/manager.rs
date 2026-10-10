@@ -6,7 +6,7 @@ use crate::config::Config;
 use crate::providers::claude::{ClaudePool, SendOutcome};
 use crate::providers::codex::Codex;
 use crate::providers::{AgentSpec, ProviderEvent};
-use crate::store::{AgentRecord, ProjectRecord, Row, Store};
+use crate::store::{AgentRecord, ProjectRecord, Row, Store, WorkspaceRecord};
 use crate::util::{new_id, now_iso};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -56,6 +56,8 @@ pub struct Manager {
     pub pairing_url: Option<String>,
     /// Directories added as projects, in insertion order.
     pub projects: Vec<ProjectRecord>,
+    /// Workspaces (including archived ones, kept for agent history).
+    pub workspaces: Vec<WorkspaceRecord>,
     /// Lets background tasks hand results back to the manager.
     pub cmds_tx: mpsc::UnboundedSender<Cmd>,
     /// Live git diff subscriptions for the Changes panel.
@@ -85,10 +87,13 @@ impl Manager {
             agents.insert(rec.id.clone(), Agent::new(rec));
         }
         let projects = store.load_projects();
-        crate::log!("loaded {} agents, {} projects", agents.len(), projects.len());
+        let workspaces = store.load_workspaces();
+        crate::log!("loaded {} agents, {} projects, {} workspaces", agents.len(), projects.len(), workspaces.len());
         let claude = ClaudePool::new(cfg.clone(), events_tx.clone());
         let codex = Codex::new(cfg.clone(), events_tx.clone());
-        (Manager { cfg, server_id, store, agents, claude, codex, bcast, events_tx, agents_dirty: false, pairing_url, projects, cmds_tx, checkout: crate::checkout::Watcher::start() }, events_rx)
+        let mut manager = Manager { cfg, server_id, store, agents, claude, codex, bcast, events_tx, agents_dirty: false, pairing_url, projects, workspaces, cmds_tx, checkout: crate::checkout::Watcher::start() };
+        manager.migrate_agent_workspaces();
+        (manager, events_rx)
     }
 
     /// Add a directory to the project registry (idempotent) and return its descriptor.
@@ -165,6 +170,10 @@ impl Manager {
                 "type": "agent_update",
                 "payload": { "kind": "upsert", "agent": a.snapshot(), "project": a.project() },
             }));
+            // Workspace status/activity is derived from its agents.
+            if let Some(ws) = &a.rec.workspace_id {
+                self.publish_workspace(ws);
+            }
         }
     }
 

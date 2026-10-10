@@ -52,7 +52,7 @@ impl Agent {
             "id": r.id,
             "provider": r.provider,
             "cwd": r.cwd,
-            "workspaceId": workspace_id(&r.cwd),
+            "workspaceId": r.workspace_id.clone().unwrap_or_else(|| workspace_id(&r.cwd)),
             "model": r.model,
             "thinkingOptionId": null,
             "createdAt": r.created_at,
@@ -138,28 +138,35 @@ pub fn cursor(seq: u64) -> Value {
     json!({ "epoch": EPOCH, "seq": seq })
 }
 
-pub fn workspace_descriptor(cwd: &str, agents: &[&Agent]) -> Value {
+pub fn workspace_descriptor(ws: &crate::store::WorkspaceRecord, agents: &[&Agent]) -> Value {
+    let dir = ws.directory.as_str();
+    let root = ws.project_root.as_str();
     let running = agents.iter().any(|a| a.status == "running");
     let needs_input = agents.iter().any(|a| !a.permissions.is_empty());
     let failed = agents.iter().any(|a| a.status == "error");
-    let status = if needs_input { "needs_input" } else if running { "running" } else if failed { "failed" } else { "done" };
-    let activity = agents.iter().map(|a| a.rec.updated_at.clone()).max();
+    let attention = agents.iter().any(|a| a.rec.attention_reason.is_some());
+    let status = if needs_input { "needs_input" } else if running { "running" } else if failed { "failed" } else if attention { "attention" } else { "done" };
+    let activity = agents.iter().map(|a| a.rec.updated_at.clone()).max().unwrap_or_else(|| ws.created_at.clone());
+    let probe = crate::checkout::probe(dir);
+    let name = ws.title.clone().or_else(|| probe.as_ref().and_then(|(_, b)| b.clone())).unwrap_or_else(|| basename(dir));
     json!({
-        "id": workspace_id(cwd),
-        "projectId": cwd,
-        "projectDisplayName": basename(cwd),
-        "projectRootPath": cwd,
-        "workspaceDirectory": cwd,
-        "projectKind": project_kind(cwd),
-        "workspaceKind": if project_kind(cwd) == "git" { "local_checkout" } else { "directory" },
-        "name": basename(cwd),
+        "id": ws.id,
+        "projectId": ws.project_id,
+        "projectDisplayName": basename(root),
+        "projectRootPath": root,
+        "workspaceDirectory": dir,
+        "projectKind": project_kind(root),
+        "workspaceKind": if probe.is_some() { "local_checkout" } else { "directory" },
+        "name": name,
+        "title": ws.title,
+        "pinnedAt": ws.pinned_at,
         "archivingAt": null,
         "status": status,
         "statusEnteredAt": null,
         "activityAt": activity,
         "scripts": [],
-        "gitRuntime": crate::checkout::probe(cwd).map(|(_, branch)| json!({ "currentBranch": branch, "isPaseoOwnedWorktree": false })),
+        "gitRuntime": probe.as_ref().map(|(_, branch)| json!({ "currentBranch": branch, "isPaseoOwnedWorktree": false })),
         "githubRuntime": null,
-        "project": project_for(cwd),
+        "project": project_for(root),
     })
 }

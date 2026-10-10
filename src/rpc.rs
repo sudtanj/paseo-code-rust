@@ -2,7 +2,7 @@
 
 use crate::manager::{reply, wrap, Agent, Cmd, Manager, Out};
 use crate::providers::{binary_available, claude_models, is_supported, modes_for};
-use crate::snapshot::{cursor, project_descriptor, timeline_entry, workspace_descriptor};
+use crate::snapshot::{cursor, project_descriptor, timeline_entry};
 use crate::store::AgentRecord;
 use crate::util::{new_id, now_iso};
 use serde_json::{json, Value};
@@ -126,11 +126,14 @@ impl Manager {
                     return rpc_error(out, &rid, &kind, "agent not found");
                 };
                 self.release_runtime(&id);
-                self.agents.remove(&id);
+                let workspace = self.agents.remove(&id).and_then(|a| a.rec.workspace_id);
                 self.store.delete_timeline(&id);
                 self.agents_dirty = true;
                 self.broadcast(json!({ "type": "agent_update", "payload": { "kind": "remove", "agentId": id } }));
                 self.broadcast(json!({ "type": "agent_deleted", "payload": { "agentId": id, "requestId": rid } }));
+                if let Some(ws) = workspace {
+                    self.publish_workspace(&ws);
+                }
             }
             "clear_agent_attention" => {
                 let ids: Vec<String> = match msg.get("agentId") {
@@ -226,13 +229,87 @@ impl Manager {
                 self.push_codex_models();
             }
             "fetch_workspaces_request" => {
-                let mut by_cwd: BTreeMap<String, Vec<&Agent>> = BTreeMap::new();
-                for a in self.agents.values().filter(|a| a.rec.archived_at.is_none()) {
-                    by_cwd.entry(a.rec.cwd.clone()).or_default().push(a);
+                let project = msg.pointer("/filter/projectId").and_then(|v| v.as_str()).map(String::from);
+                let entries = self.workspace_entries(project.as_deref());
+                let mut payload = json!({ "requestId": rid, "entries": entries, "emptyProjects": self.empty_projects(), "pageInfo": { "nextCursor": null, "prevCursor": null, "hasMore": false } });
+                // Every session already receives every workspace_update.
+                if let Some(sub) = msg.get("subscribe").filter(|v| !v.is_null()) {
+                    payload["subscriptionId"] = json!(sub.get("subscriptionId").and_then(|v| v.as_str()).map(String::from).unwrap_or_else(new_id));
                 }
-                let entries: Vec<Value> = by_cwd.iter().map(|(cwd, agents)| workspace_descriptor(cwd, agents)).collect();
-                let empty: Vec<Value> = self.projects.iter().filter(|p| !by_cwd.contains_key(&p.root_path)).map(|p| project_descriptor(&p.root_path)).collect();
-                reply(out, json!({ "type": "fetch_workspaces_response", "payload": { "requestId": rid, "entries": entries, "emptyProjects": empty, "pageInfo": { "nextCursor": null, "prevCursor": null, "hasMore": false } } }));
+                reply(out, json!({ "type": "fetch_workspaces_response", "payload": payload }));
+            }
+            "workspace.create.request" => {
+                let source = msg.get("source").cloned().unwrap_or(Value::Null);
+                let fail = |error: String, code: &str| json!({ "type": "workspace.create.response", "payload": { "requestId": rid, "workspace": null, "setupTerminalId": null, "error": error, "errorCode": code } });
+                if s(&source, "kind").as_deref() != Some("directory") {
+                    return reply(out, fail("paseo-lite does not create git worktrees yet; choose Local isolation".into(), "unsupported"));
+                }
+                let dir = match normalize_dir(&s(&source, "path").unwrap_or_default()) {
+                    Ok(d) => d,
+                    Err(e) => return reply(out, fail(format!("Directory not found: {e}"), "directory_not_found")),
+                };
+                // projectId is the project root path; fall back to the directory itself.
+                let root = s(&source, "projectId").filter(|p| self.projects.iter().any(|r| &r.root_path == p)).unwrap_or_else(|| dir.clone());
+                if !self.projects.iter().any(|r| r.root_path == root) {
+                    self.register_project(&root);
+                }
+                let id = self.create_workspace(&root, &dir);
+                self.publish_workspace(&id);
+                crate::log!("workspace {id} created in {dir}");
+                reply(out, json!({ "type": "workspace.create.response", "payload": { "requestId": rid, "workspace": self.workspace_json(&id), "setupTerminalId": null, "error": null } }));
+            }
+            "archive_workspace_request" => {
+                let id = s(&msg, "workspaceId").unwrap_or_default();
+                let payload = match self.archive_workspace(&id) {
+                    Ok(at) => json!({ "requestId": rid, "workspaceId": id, "archivedAt": at, "error": null }),
+                    Err(e) => json!({ "requestId": rid, "workspaceId": id, "archivedAt": null, "error": e }),
+                };
+                reply(out, json!({ "type": "archive_workspace_response", "payload": payload }));
+            }
+            "workspace.title.set.request" => {
+                let id = s(&msg, "workspaceId").unwrap_or_default();
+                let title = s(&msg, "title").map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+                let payload = match self.update_workspace(&id, |w| w.title = title.clone()) {
+                    Some(w) => json!({ "requestId": rid, "workspaceId": id, "accepted": true, "title": w.title, "error": null }),
+                    None => json!({ "requestId": rid, "workspaceId": id, "accepted": false, "title": null, "error": "workspace not found" }),
+                };
+                reply(out, json!({ "type": "workspace.title.set.response", "payload": payload }));
+            }
+            "workspace.pin.set.request" => {
+                let id = s(&msg, "workspaceId").unwrap_or_default();
+                let pinned = msg.get("pinned").and_then(|v| v.as_bool()).unwrap_or(false);
+                let payload = match self.update_workspace(&id, |w| w.pinned_at = if pinned { Some(now_iso()) } else { None }) {
+                    Some(w) => json!({ "requestId": rid, "workspaceId": id, "accepted": true, "pinnedAt": w.pinned_at, "error": null }),
+                    None => json!({ "requestId": rid, "workspaceId": id, "accepted": false, "pinnedAt": null, "error": "workspace not found" }),
+                };
+                reply(out, json!({ "type": "workspace.pin.set.response", "payload": payload }));
+            }
+            "workspace.clear_attention.request" => {
+                let ids: Vec<String> = match msg.get("workspaceId") {
+                    Some(Value::Array(list)) => list.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+                    Some(Value::String(one)) => vec![one.clone()],
+                    _ => vec![],
+                };
+                let mut results = Vec::new();
+                let mut all_cleared: Vec<String> = Vec::new();
+                for ws in &ids {
+                    let cleared: Vec<String> = self.agents.values().filter(|a| a.rec.workspace_id.as_deref() == Some(ws.as_str()) && a.rec.attention_reason.is_some()).map(|a| a.rec.id.clone()).collect();
+                    for agent_id in &cleared {
+                        if let Some(a) = self.agents.get_mut(agent_id) {
+                            a.rec.attention_reason = None;
+                            a.rec.attention_at = None;
+                        }
+                        self.agents_dirty = true;
+                        self.publish_agent(agent_id);
+                    }
+                    results.push(json!({ "workspaceId": ws, "clearedAgentIds": cleared, "success": true, "error": null }));
+                    all_cleared.extend(cleared);
+                }
+                reply(out, json!({ "type": "workspace.clear_attention.response", "payload": { "requestId": rid, "workspaceId": msg.get("workspaceId").cloned().unwrap_or(Value::Null), "clearedAgentIds": all_cleared, "results": results, "success": true, "error": null } }));
+            }
+            "workspace_setup_status_request" => {
+                // No setup scripts in paseo-lite: report "nothing to show".
+                reply(out, json!({ "type": "workspace_setup_status_response", "payload": { "requestId": rid, "workspaceId": s(&msg, "workspaceId").unwrap_or_default(), "snapshot": null } }));
             }
             "project.list.request" => {
                 let mut paths: Vec<String> = self.projects.iter().map(|p| p.root_path.clone()).collect();
@@ -393,10 +470,17 @@ impl Manager {
             .and_then(|l| l.as_object())
             .map(|m| m.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string()))).collect())
             .unwrap_or_default();
+        // The app creates the workspace first (workspace.create) and passes its id;
+        // older clients and the built-in UI get the directory's default workspace.
+        let workspace_id = match s(msg, "workspaceId").filter(|id| self.workspaces.iter().any(|w| &w.id == id && w.archived_at.is_none())) {
+            Some(id) => id,
+            None => self.find_or_create_workspace(&cwd),
+        };
         let rec = AgentRecord {
             id: new_id(),
             provider,
             cwd,
+            workspace_id: Some(workspace_id),
             model: s(&config, "model").filter(|m| !m.is_empty()),
             mode_id: s(&config, "modeId"),
             title: s(&config, "title"),
