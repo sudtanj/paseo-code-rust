@@ -123,6 +123,8 @@ pub struct Manager {
     pub clients: Vec<Presence>,
     /// App-editable settings (custom models, appended system prompt).
     pub daemon_config: crate::daemon_config::DaemonConfig,
+    /// Tokens and cost per provider and model.
+    pub usage: crate::usage::Ledger,
 }
 
 /// A client blocked in `wait_for_finish_request` until the agent stops
@@ -160,13 +162,14 @@ impl Manager {
         let workspaces = store.load_workspaces();
         let push_tokens = crate::push::TokenStore::load(&cfg.home);
         let daemon_config = crate::daemon_config::DaemonConfig::load(&cfg.home);
+        let usage = crate::usage::Ledger::load(&cfg.home);
         for p in &projects {
             crate::snapshot::set_project_name(&p.root_path, p.custom_name.as_deref());
         }
         crate::log!("loaded {} agents, {} projects, {} workspaces", agents.len(), projects.len(), workspaces.len());
         let claude = ClaudePool::new(cfg.clone(), events_tx.clone());
         let codex = Codex::new(cfg.clone(), events_tx.clone());
-        let mut manager = Manager { cfg, server_id, store, agents, claude, codex, active_cli: None, running: HashSet::new(), cli_queue: VecDeque::new(), claude_warm_at: None, codex_warm_at: None, bcast, events_tx, agents_dirty: false, pairing_url, projects, workspaces, cmds_tx, checkout: crate::checkout::Watcher::start(), started_at: now_iso(), waiters: Vec::new(), push_tokens, clients: Vec::new(), daemon_config };
+        let mut manager = Manager { cfg, server_id, store, agents, claude, codex, active_cli: None, running: HashSet::new(), cli_queue: VecDeque::new(), claude_warm_at: None, codex_warm_at: None, bcast, events_tx, agents_dirty: false, pairing_url, projects, workspaces, cmds_tx, checkout: crate::checkout::Watcher::start(), started_at: now_iso(), waiters: Vec::new(), push_tokens, clients: Vec::new(), daemon_config, usage };
         manager.migrate_agent_workspaces();
         (manager, events_rx)
     }
@@ -304,6 +307,7 @@ impl Manager {
             self.agents_dirty = false;
             self.store.save_agents(self.agents.values().map(|a| &a.rec));
         }
+        self.usage.save_if_dirty();
     }
 
     pub fn broadcast(&self, msg: Value) {
@@ -887,6 +891,13 @@ impl Manager {
         }
     }
 
+    /// The model Codex uses for agents that didn't pick one.
+    fn codex_default_model(&self) -> Option<String> {
+        let models = self.codex.cached_models()?;
+        let list = models.as_array()?;
+        list.iter().find(|m| m.get("isDefault").and_then(|v| v.as_bool()) == Some(true)).or(list.first()).and_then(|m| m.get("id")).and_then(|v| v.as_str()).map(String::from)
+    }
+
     fn handle_event(&mut self, ev: ProviderEvent) {
         match ev {
             ProviderEvent::SessionStarted { agent_id, session_id } => {
@@ -931,7 +942,23 @@ impl Manager {
                         let window = crate::providers::claude_context_window(model).unwrap_or(if model.to_ascii_lowercase().contains("[1m]") { 1_000_000 } else { self.cfg.claude_context_window });
                         usage["contextWindowMaxTokens"] = json!(window);
                     }
+                    // Show what the agent has spent overall, not just this session.
+                    if let Some(total) = self.usage.agent_total(&agent_id).filter(|t| t.cost > 0.0) {
+                        usage["totalCostUsd"] = json!(total.cost);
+                    }
                     a.rec.last_usage = Some(usage);
+                }
+            }
+            ProviderEvent::Spend { agent_id, sample } => {
+                let Some(a) = self.agents.get(&agent_id) else { return };
+                let provider = a.rec.provider.clone();
+                let model = a.rec.model.clone().filter(|m| !m.is_empty()).or_else(|| (provider == "codex").then(|| self.codex_default_model()).flatten()).unwrap_or_else(|| provider.clone());
+                self.usage.record(&agent_id, &provider, &model, sample);
+                let total = self.usage.agent_total(&agent_id).unwrap_or_default();
+                if let Some(Value::Object(u)) = self.agents.get_mut(&agent_id).and_then(|a| a.rec.last_usage.as_mut()) {
+                    if total.cost > 0.0 {
+                        u.insert("totalCostUsd".into(), json!(total.cost));
+                    }
                 }
             }
             ProviderEvent::TurnCompleted { agent_id } => self.finish_turn(&agent_id, Ok(None)),

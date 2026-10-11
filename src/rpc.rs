@@ -129,6 +129,8 @@ impl Manager {
                 self.release_runtime(&id);
                 let workspace = self.agents.remove(&id).and_then(|a| a.rec.workspace_id);
                 self.store.delete_timeline(&id);
+                // Its spend stays in the provider totals.
+                self.usage.forget_agent(&id);
                 self.agents_dirty = true;
                 self.broadcast(json!({ "type": "agent_update", "payload": { "kind": "remove", "agentId": id } }));
                 self.broadcast(json!({ "type": "agent_deleted", "payload": { "agentId": id, "requestId": rid } }));

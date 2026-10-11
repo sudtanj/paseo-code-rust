@@ -62,6 +62,8 @@ fn server_info(ctx: &Ctx) -> Arc<str> {
                 "checkoutDiscardChanges": true,
                 "commitsList": true,
                 "commitBaseClassification": true,
+                "usageSources": true,
+                "providerUsageList": true,
             },
         } } })
         .to_string(),

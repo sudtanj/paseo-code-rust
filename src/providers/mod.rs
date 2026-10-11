@@ -32,6 +32,8 @@ pub enum ProviderEvent {
     Timeline { agent_id: String, item: Value },
     Permission { agent_id: String, request: Value, reply: oneshot::Sender<Value> },
     Usage { agent_id: String, usage: Value },
+    /// Running token/cost totals for the usage ledger.
+    Spend { agent_id: String, sample: crate::usage::Sample },
     TurnCompleted { agent_id: String },
     TurnFailed { agent_id: String, error: String },
     TurnCanceled { agent_id: String, reason: String },

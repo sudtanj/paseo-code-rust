@@ -41,11 +41,13 @@ fn unique_dir(tag: &str) -> PathBuf {
 fn fake_claude(dir: &std::path::Path, mode: &str) -> PathBuf {
     let path = dir.join(format!("fake-claude-{mode}.sh"));
     let script = r#"#!/bin/sh
+n=0
 while IFS= read -r line; do
   case "$line" in
     *'"type":"user"'*)
       printf '%s\n' '{"type":"assistant","message":{"id":"m1","role":"assistant","content":[{"type":"text","text":"hello from fake claude"}],"usage":{"input_tokens":3,"output_tokens":4}}}'
-      printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"usage":{"input_tokens":3,"output_tokens":4},"total_cost_usd":0.0}'
+      n=$((n+1))
+      printf '{"type":"result","subtype":"success","is_error":false,"usage":{"input_tokens":3,"output_tokens":4},"total_cost_usd":0.0,"session_id":"fake-session","modelUsage":{"claude-test":{"inputTokens":%d,"outputTokens":%d,"cacheReadInputTokens":0,"cacheCreationInputTokens":0,"costUSD":%d}}}\n' $((100*n)) $((10*n)) $n
       ;;
   esac
 done
@@ -172,6 +174,7 @@ async fn handshake_announces_features() {
     assert_eq!(payload["status"], "server_info");
     assert_eq!(payload["features"]["projectAdd"], true);
     assert_eq!(payload["features"]["providerRemoval"], true);
+    assert_eq!(payload["features"]["usageSources"], true);
 }
 
 #[tokio::test]
@@ -275,6 +278,32 @@ async fn agent_turn_with_fake_claude() {
     assert!(items.contains(&"assistant_message".to_string()), "{items:?}");
     let text = tl["entries"].as_array().unwrap().iter().find(|e| e["item"]["type"] == "assistant_message").unwrap()["item"]["text"].as_str().unwrap().to_string();
     assert!(text.contains("hello from fake claude"));
+
+    // Usage: the turn's tokens and cost are booked for Claude, streamed per provider.
+    send(&mut ws, session(json!({ "type": "usage.list_reports.request", "requestId": "u1" }))).await;
+    let mut reports = Vec::new();
+    loop {
+        let v = recv_until(&mut ws, |v| {
+            let t = v["message"]["type"].as_str().unwrap_or("");
+            (t.starts_with("usage.list_reports.") && v["message"]["payload"]["requestId"] == "u1").then(|| v["message"].clone())
+        })
+        .await;
+        if v["type"] == "usage.list_reports.response" {
+            assert!(v["payload"]["error"].is_null(), "{v}");
+            break;
+        }
+        reports.push(v["payload"]["report"].clone());
+    }
+    let claude = reports.iter().find(|r| r["id"] == "claude").expect("claude report");
+    let balance = |r: &Value, id: &str| r["report"]["balances"].as_array().unwrap().iter().find(|b| b["id"] == id).unwrap()["used"].clone();
+    assert_eq!(balance(claude, "tokens-today"), 110, "{claude}");
+    assert_eq!(balance(claude, "cost-today").as_f64(), Some(1.0));
+    assert!(claude["report"]["details"].as_array().unwrap().iter().any(|d| d["label"] == "claude-test"), "{claude}");
+    // An agent sees its own provider, with its own spend first.
+    send(&mut ws, session(json!({ "type": "usage.list_reports.request", "requestId": "u2", "agentId": agent_id }))).await;
+    let mine = recv_until(&mut ws, |v| (v["message"]["type"] == "usage.list_reports.update" && v["message"]["payload"]["requestId"] == "u2").then(|| v["message"]["payload"]["report"].clone())).await;
+    assert_eq!(mine["id"], "claude");
+    assert_eq!(balance(&mine, "agent-tokens"), 110);
 
     // History lists the agent, and it can be archived.
     send(&mut ws, session(json!({ "type": "fetch_agent_history_request", "requestId": "h1" }))).await;

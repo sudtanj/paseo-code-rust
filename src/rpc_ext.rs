@@ -44,6 +44,8 @@ impl Manager {
             "wait_for_finish_request" => self.wait_for_finish(msg, &agent_key, rid, out),
             "agent.timeline.list_prompts.request" => self.list_prompts(&agent_key, rid, out),
             "daemon.get_status.request" => self.daemon_status(rid, out),
+            "usage.list_reports.request" => self.usage_reports(msg, rid, out),
+            "provider.usage.list.request" => self.legacy_usage(rid, out),
             "get_daemon_config_request" => self.daemon_config(rid, out),
             "set_daemon_config_request" => self.set_daemon_config(msg, rid, out),
             "diagnostics.request" => {
@@ -556,5 +558,57 @@ impl Manager {
             // The archive already succeeded; a kept folder is only logged.
             self.cleanup_dir(root, owned, |_| {});
         }
+    }
+}
+
+/// Usage: tokens and API-priced cost per provider (see `usage`).
+impl Manager {
+    const USAGE_SOURCES: [(&'static str, &'static str); 2] = [("claude", "Claude Code"), ("codex", "Codex")];
+
+    fn usage_entries(&self, agent: Option<&str>, ids: Option<Vec<String>>) -> Vec<Value> {
+        let agent_provider = agent.and_then(|id| self.agents.get(id)).map(|a| a.rec.provider.clone());
+        Self::USAGE_SOURCES
+            .iter()
+            .filter(|(id, _)| match (&agent, &agent_provider) {
+                // An agent's view is its own provider only.
+                (Some(_), Some(p)) => p == *id,
+                (Some(_), None) => false,
+                (None, _) => ids.as_ref().map(|ids: &Vec<String>| ids.iter().any(|i| i == *id)).unwrap_or(true),
+            })
+            .map(|(id, label)| self.usage.report(id, label, agent))
+            .collect()
+    }
+
+    fn usage_reports(&self, msg: &Value, rid: &str, out: &Out) {
+        let agent_key = s(msg, "agentId");
+        let agent = agent_key.map(|k| self.resolve(&k).unwrap_or(k));
+        let ids = msg.get("reportIds").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+        for report in self.usage_entries(agent.as_deref(), ids) {
+            reply(out, json!({ "type": "usage.list_reports.update", "payload": { "requestId": rid, "report": report } }));
+        }
+        reply(out, json!({ "type": "usage.list_reports.response", "payload": { "requestId": rid, "error": null } }));
+    }
+
+    // COMPAT(providerUsageList): apps from before usage sources ask for this.
+    fn legacy_usage(&self, rid: &str, out: &Out) {
+        let fetched_at = now_iso();
+        let providers: Vec<Value> = self
+            .usage_entries(None, None)
+            .into_iter()
+            .map(|e| {
+                json!({
+                    "providerId": e["sourceId"],
+                    "displayName": e["sourceLabel"],
+                    "status": "available",
+                    "planLabel": null,
+                    "sourceLabel": e["account"]["label"],
+                    "fetchedAt": e["fetchedAt"],
+                    "windows": [],
+                    "balances": e["report"]["balances"],
+                    "details": e["report"]["details"],
+                })
+            })
+            .collect();
+        reply(out, json!({ "type": "provider.usage.list.response", "payload": { "requestId": rid, "fetchedAt": fetched_at, "providers": providers } }));
     }
 }

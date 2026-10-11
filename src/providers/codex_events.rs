@@ -73,6 +73,10 @@ impl Codex {
             "thread/tokenUsage/updated" => {
                 let usage = params.get("tokenUsage").or_else(|| params.get("usage")).cloned().unwrap_or(Value::Null);
                 let total = usage.get("total").unwrap_or(&usage);
+                let thread = s(params, "threadId").or_else(|| s(params, "conversationId")).unwrap_or_default();
+                if let Some(sample) = crate::usage::codex_sample(&thread, total) {
+                    self.emit(ProviderEvent::Spend { agent_id: agent_id.clone(), sample });
+                }
                 let pick = |k: &str| total.get(k).cloned().unwrap_or(Value::Null);
                 let usage = json!({
                     "inputTokens": pick("inputTokens"),

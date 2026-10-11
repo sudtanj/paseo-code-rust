@@ -17,6 +17,7 @@ mod session;
 mod snapshot;
 mod store;
 mod uploads;
+mod usage;
 mod util;
 mod workspaces;
 
@@ -107,6 +108,8 @@ async fn run(cfg: Config, identity: Arc<e2ee::DaemonIdentity>) {
 
     crate::log!("paseo-lite {} serverId={} home={}", env!("CARGO_PKG_VERSION"), identity.server_id, cfg.home.display());
     uploads::prune(&cfg.home);
+    usage::load_prices(&cfg.home);
+    tokio::spawn(usage::refresh_prices(cfg.home.clone()));
     if cfg.relay_enabled {
         print_pairing(&cfg, &identity);
         tokio::spawn(relay::run(ctx.clone(), cfg.clone(), identity.clone()));

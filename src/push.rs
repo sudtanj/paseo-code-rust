@@ -143,23 +143,35 @@ pub async fn send(tokens: Vec<String>, payload: Value) -> Vec<String> {
 
 /// Minimal HTTPS POST (HTTP/1.1, `Connection: close`) returning status and body.
 async fn post_json(host: &str, path: &str, body: &str) -> Result<(u16, String), String> {
+    request("POST", host, path, Some(body), 256 * 1024, Duration::from_secs(20)).await
+}
+
+/// Minimal HTTPS GET returning status and body (at most `max` bytes read).
+pub async fn get(host: &str, path: &str, max: u64, timeout: Duration) -> Result<(u16, String), String> {
+    request("GET", host, path, None, max, timeout).await
+}
+
+async fn request(method: &str, host: &str, path: &str, body: Option<&str>, max: u64, timeout: Duration) -> Result<(u16, String), String> {
     let work = async {
         let tcp = tokio::net::TcpStream::connect((host, 443)).await.map_err(|e| e.to_string())?;
         let _ = tcp.set_nodelay(true);
         let name = rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|e| e.to_string())?;
         let mut tls = tokio_rustls::TlsConnector::from(crate::relay::tls_config()).connect(name, tcp).await.map_err(|e| e.to_string())?;
-        let request = format!(
-            "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nAccept: application/json\r\nUser-Agent: paseo-lite/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            env!("CARGO_PKG_VERSION"),
-            body.len()
-        );
+        let agent = format!("paseo-lite/{}", env!("CARGO_PKG_VERSION"));
+        let request = match body {
+            Some(body) => format!(
+                "{method} {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nAccept: application/json\r\nUser-Agent: {agent}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+            None => format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {agent}\r\nConnection: close\r\n\r\n"),
+        };
         tls.write_all(request.as_bytes()).await.map_err(|e| e.to_string())?;
         let mut raw = Vec::new();
         // Servers may skip TLS close_notify on Connection: close; keep what arrived.
-        let _ = (&mut tls).take(256 * 1024).read_to_end(&mut raw).await;
+        let _ = (&mut tls).take(max).read_to_end(&mut raw).await;
         parse_response(&raw)
     };
-    tokio::time::timeout(Duration::from_secs(20), work).await.map_err(|_| "timed out".to_string())?
+    tokio::time::timeout(timeout, work).await.map_err(|_| "timed out".to_string())?
 }
 
 fn parse_response(raw: &[u8]) -> Result<(u16, String), String> {

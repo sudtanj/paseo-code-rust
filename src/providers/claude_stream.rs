@@ -174,6 +174,9 @@ impl StreamState {
             });
             self.emit(ProviderEvent::Usage { agent_id: agent_id.clone(), usage });
         }
+        if let Some(sample) = crate::usage::claude_sample(msg) {
+            self.emit(ProviderEvent::Spend { agent_id: agent_id.clone(), sample });
+        }
         // Drop any tool rows still running; their results will never arrive.
         for (id, (name, input)) in self.tools.drain() {
             let detail = tools::claude_detail(&name, &input, None);

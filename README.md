@@ -15,6 +15,7 @@ so you can pair it with the Paseo apps exactly like the Node daemon.
 | One CLI at a time | both run freely | only one CLI has a process at any time. All turns from every project and both providers share one FIFO queue. The active CLI stays warm (pre-started at launch for the last used provider). When the next queued turn needs the other CLI, it waits for running turns to finish, the active CLI is shut down, and the other one cold-starts and stays warm until the next switch. Codex model listing never starts Codex while Claude Code is active |
 | Queued messages | each waits for its own turn | messages sent to a chat while it is busy are combined into **one** turn when the current one finishes (same conversation, one round trip, the context is sent once). Each still shows as its own bubble; slash commands always run on their own |
 | Images and files | inline images and uploaded files | same protocol: images sent with a message and files uploaded through `file.upload` (binary frames, up to 100 MB) are saved under `~/.paseo-lite/uploads` (kept 14 days). The agent is told each file's path; images are also given to the model as images (Claude image blocks, Codex local images) |
+| Usage | plan limit windows from provider plugins | tokens and cost **per provider and model**, booked from the CLIs' own totals (Claude Code `modelUsage` incl. its USD cost; Codex `tokenUsage`, priced from LiteLLM's public price list, refreshed daily). Shown in the app's Usage screen: cost today / 7 / 30 days / all time, tokens, the in/cached/out split and the top models; an agent's view adds its own spend. Costs are API list prices (what the tokens would cost through the API), not subscription billing. Days are UTC; kept in `~/.paseo-lite/usage.json` |
 | Timelines | in memory | append-only JSONL on disk; streamed chunks merged into one row; unloaded from memory after `PASEO_TIMELINE_UNLOAD_SECS` idle; tool output clipped to 16 KiB |
 | Projects | — | a project is just a directory; adding one costs no process and no memory until an agent runs a turn |
 
@@ -141,6 +142,7 @@ src/relay.rs, e2ee.rs    relay v2 client + NaCl box channel
 src/providers/claude*.rs Claude Code pool + stream-json parser
 src/providers/codex*.rs  shared Codex app-server client + event mapping
 src/store.rs             agents.json + JSONL timelines
+src/usage.rs             token/cost ledger per provider and model, price list
 web/index.html           built-in web UI
 ```
 
