@@ -26,7 +26,7 @@ const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 /// Slow fallback poll; turn completions trigger an immediate refresh.
 const REFRESH_EVERY: Duration = Duration::from_secs(20);
 
-fn expand(cwd: &str) -> PathBuf {
+pub(crate) fn expand(cwd: &str) -> PathBuf {
     let p = match (cwd.strip_prefix('~'), std::env::var("HOME")) {
         (Some(rest), Ok(home)) if rest.is_empty() || rest.starts_with('/') => format!("{home}{rest}"),
         _ => cwd.to_string(),
@@ -38,11 +38,11 @@ pub(crate) async fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
     run("git", args, Some(cwd), GIT_TIMEOUT).await
 }
 
-async fn git_ok(cwd: &Path, args: &[&str]) -> Option<String> {
+pub(crate) async fn git_ok(cwd: &Path, args: &[&str]) -> Option<String> {
     git(cwd, args).await.ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
-fn checkout_error(message: impl Into<String>, code: &str) -> Value {
+pub(crate) fn checkout_error(message: impl Into<String>, code: &str) -> Value {
     json!({ "code": code, "message": message.into() })
 }
 
@@ -63,7 +63,7 @@ pub fn probe(cwd: &str) -> Option<(PathBuf, Option<String>)> {
 }
 
 /// Default branch name ("main"), as upstream resolves it.
-async fn default_branch(cwd: &Path) -> Option<String> {
+pub(crate) async fn default_branch(cwd: &Path) -> Option<String> {
     if let Some(r) = git_ok(cwd, &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]).await {
         return r.strip_prefix("refs/remotes/origin/").map(String::from);
     }
@@ -108,6 +108,8 @@ pub async fn status(cwd: &str, request_id: &str) -> Value {
     };
     let base = default_branch(&dir).await;
     let ahead_behind = match &base {
+        // On the base branch itself upstream reports no comparison.
+        Some(b) if branch.as_deref() == Some(b.as_str()) => None,
         Some(b) => {
             let base_ref = best_base_ref(&dir, b).await;
             git_ok(&dir, &["rev-list", "--left-right", "--count", &format!("HEAD...{base_ref}")]).await.and_then(|c| {
@@ -117,19 +119,18 @@ pub async fn status(cwd: &str, request_id: &str) -> Value {
         }
         None => None,
     };
-    let remotes = git_ok(&dir, &["remote"]).await;
     let remote_url = git_ok(&dir, &["remote", "get-url", "origin"]).await;
     json!({
         "cwd": cwd, "error": null, "requestId": request_id, "upstreamRef": upstream,
         "isGit": true, "isPaseoOwnedWorktree": false, "repoRoot": repo_root, "mainRepoRoot": null,
         "currentBranch": branch, "isDirty": dirty, "baseRef": base, "aheadBehind": ahead_behind,
         "aheadOfOrigin": ahead_origin, "behindOfOrigin": behind_origin,
-        "hasRemote": remotes.is_some(), "remoteUrl": remote_url,
+        "hasRemote": remote_url.is_some(), "remoteUrl": remote_url,
     })
 }
 
 /// Prefer `origin/<name>` when it exists (what upstream compares against).
-async fn best_base_ref(cwd: &Path, name: &str) -> String {
+pub(crate) async fn best_base_ref(cwd: &Path, name: &str) -> String {
     let origin = format!("origin/{name}");
     if git(cwd, &["rev-parse", "--verify", "--quiet", &origin]).await.is_ok() { origin } else { name.to_string() }
 }

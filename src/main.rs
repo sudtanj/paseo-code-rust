@@ -4,6 +4,7 @@ mod config;
 mod daemon_config;
 mod e2ee;
 mod files;
+mod git_actions;
 mod manager;
 mod projects;
 mod push;

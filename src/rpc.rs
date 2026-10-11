@@ -437,7 +437,8 @@ impl Manager {
                 reply(out, json!({ "type": "pong", "payload": payload }));
             }
             _ => {
-                if !self.handle_ext_rpc(&kind, &msg, &rid, out) && request_id.is_some() {
+                let git = crate::git_actions::GitCtx { watcher: self.checkout.clone(), bcast: self.bcast.clone() };
+                if !crate::git_actions::handle(&git, &kind, &msg, &rid, out) && !self.handle_ext_rpc(&kind, &msg, &rid, out) && request_id.is_some() {
                     rpc_error(out, &rid, &kind, "not supported by paseo-lite");
                 }
             }

@@ -50,8 +50,9 @@ paseo-lite speaks Paseo's core WebSocket protocol subset with the upstream messa
 - daemon and projects: `daemon.get_status`, `get_daemon_config` / `set_daemon_config` (custom models via `providers.<id>.additionalModels`, `appendSystemPrompt`; saved in `daemon-config.json`), `diagnostics`,
   `project.rename`, `project.remove` / `archive_workspace` (archive the agents and clean up the folder, see below), `workspace.title.set`,
   `workspace.clear_attention`.
+- git actions for the Changes panel (no agent turn needed): commit (with an auto-written message when empty), push, pull, switch/rename/validate branch, branch suggestions, discard changes, refresh (fetch), commit history with per-file stats and diffs, stash save/pop/list, merge into base / merge from base, and pull request status/create/merge through the `gh` CLI.
 
-Anything else (git actions, file editing, terminals, plugins, voice, schedules, Hub, worktrees) answers with
+Anything else (file editing, terminals, plugins, voice, schedules, Hub, worktrees) answers with
 `rpc_error` / `unsupported`. The official app is expected to handle the core agent flow. Screens built
 on unsupported features will show errors.
 

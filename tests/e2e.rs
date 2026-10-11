@@ -263,3 +263,91 @@ async fn agent_turn_with_fake_claude() {
     send(&mut ws, session(json!({ "type": "archive_agent_request", "requestId": "z1", "agentId": agent_id }))).await;
     recv_until(&mut ws, |v| (v["message"]["type"] == "agent_archived").then_some(())).await;
 }
+
+fn git(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = Command::new("git").args(args).current_dir(dir).output().expect("git");
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+async fn rpc(ws: &mut Ws, msg: Value, response: &str) -> Value {
+    send(ws, session(msg)).await;
+    recv_until(ws, |v| (v["message"]["type"] == response).then(|| v["message"]["payload"].clone())).await
+}
+
+#[tokio::test]
+async fn git_actions_commit_branch_stash_history() {
+    let d = start("git", None);
+    let repo = d.dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test"]);
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+    let cwd = repo.to_string_lossy().to_string();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+
+    // Commit with an explicit message, and with none (auto-generated).
+    std::fs::write(repo.join("a.txt"), "two\n").unwrap();
+    let r = rpc(&mut ws, json!({ "type": "checkout_commit_request", "requestId": "g1", "cwd": cwd, "message": "Change a" }), "checkout_commit_response").await;
+    assert_eq!(r["success"], true, "{r}");
+    std::fs::write(repo.join("b.txt"), "new\n").unwrap();
+    let r = rpc(&mut ws, json!({ "type": "checkout_commit_request", "requestId": "g2", "cwd": cwd }), "checkout_commit_response").await;
+    assert_eq!(r["success"], true, "{r}");
+    assert!(git(&repo, &["log", "-1", "--format=%s"]).contains("b.txt"));
+
+    // Rename the branch, then check suggestions and validation see it.
+    let r = rpc(&mut ws, json!({ "type": "checkout.rename_branch.request", "requestId": "g3", "cwd": cwd, "branch": "feat/x" }), "checkout.rename_branch.response").await;
+    assert_eq!(r["currentBranch"], "feat/x", "{r}");
+    let r = rpc(&mut ws, json!({ "type": "branch_suggestions_request", "requestId": "g4", "cwd": cwd, "query": "feat" }), "branch_suggestions_response").await;
+    assert_eq!(r["branches"], json!(["feat/x"]), "{r}");
+    let r = rpc(&mut ws, json!({ "type": "validate_branch_request", "requestId": "g5", "cwd": cwd, "branchName": "feat/x" }), "validate_branch_response").await;
+    assert_eq!(r["exists"], true);
+    let r = rpc(&mut ws, json!({ "type": "validate_branch_request", "requestId": "g6", "cwd": cwd, "branchName": "nope" }), "validate_branch_response").await;
+    assert_eq!(r["exists"], false);
+
+    // Stash a change, list it, pop it back.
+    std::fs::write(repo.join("a.txt"), "three\n").unwrap();
+    let r = rpc(&mut ws, json!({ "type": "stash_save_request", "requestId": "g7", "cwd": cwd, "branch": "feat/x" }), "stash_save_response").await;
+    assert_eq!(r["success"], true, "{r}");
+    let r = rpc(&mut ws, json!({ "type": "stash_list_request", "requestId": "g8", "cwd": cwd }), "stash_list_response").await;
+    assert_eq!(r["entries"][0]["branch"], "feat/x", "{r}");
+    assert_eq!(r["entries"][0]["isPaseo"], true);
+    let r = rpc(&mut ws, json!({ "type": "stash_pop_request", "requestId": "g9", "cwd": cwd, "stashIndex": 0 }), "stash_pop_response").await;
+    assert_eq!(r["success"], true, "{r}");
+    assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "three\n");
+
+    // Discard brings the file back to HEAD; untracked files are removed.
+    std::fs::write(repo.join("junk.txt"), "x").unwrap();
+    let r = rpc(&mut ws, json!({ "type": "checkout.discard_changes.request", "requestId": "g10", "cwd": cwd, "paths": ["a.txt", "junk.txt"] }), "checkout.discard_changes.response").await;
+    assert_eq!(r["success"], true, "{r}");
+    assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "two\n");
+    assert!(!repo.join("junk.txt").exists());
+
+    // Switch back to a new main and merge feat/x into it from the branch.
+    git(&repo, &["branch", "main"]);
+    let r = rpc(&mut ws, json!({ "type": "checkout_switch_branch_request", "requestId": "g11", "cwd": cwd, "branch": "main" }), "checkout_switch_branch_response").await;
+    assert_eq!(r["success"], true, "{r}");
+    assert_eq!(r["source"], "local");
+
+    // History with file stats, and a single commit's file diff.
+    let r = rpc(&mut ws, json!({ "type": "checkout.commits.list.request", "requestId": "g12", "cwd": cwd }), "checkout.commits.list.response").await;
+    let commits = r["commits"].as_array().unwrap();
+    assert!(commits.len() >= 3, "{r}");
+    let change_a = commits.iter().find(|c| c["subject"] == "Change a").unwrap();
+    assert_eq!(change_a["files"][0]["path"], "a.txt");
+    let sha = change_a["sha"].as_str().unwrap();
+    let r = rpc(&mut ws, json!({ "type": "checkout.commits.file_diff.request", "requestId": "g13", "cwd": cwd, "sha": sha, "path": "a.txt" }), "checkout.commits.file_diff.response").await;
+    assert_eq!(r["file"]["path"], "a.txt", "{r}");
+    assert_eq!(r["file"]["additions"], 1);
+
+    // Not a repository -> NOT_GIT_REPO; PR status without a remote -> no_remote.
+    let r = rpc(&mut ws, json!({ "type": "checkout_push_request", "requestId": "g14", "cwd": d.dir.to_string_lossy() }), "checkout_push_response").await;
+    assert_eq!(r["error"]["code"], "NOT_GIT_REPO", "{r}");
+    let r = rpc(&mut ws, json!({ "type": "checkout_pr_status_request", "requestId": "g15", "cwd": cwd }), "checkout_pr_status_response").await;
+    assert_eq!(r["authState"], "no_remote", "{r}");
+    assert!(r["status"].is_null());
+}

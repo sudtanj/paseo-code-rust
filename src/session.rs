@@ -50,6 +50,10 @@ fn server_info(ctx: &Ctx) -> Arc<str> {
                 "daemonDiagnostics": true,
                 "pushTokenRevocation": true,
                 "providerRemoval": true,
+                "checkoutRefresh": true,
+                "checkoutDiscardChanges": true,
+                "commitsList": true,
+                "commitBaseClassification": true,
             },
         } } })
         .to_string(),
