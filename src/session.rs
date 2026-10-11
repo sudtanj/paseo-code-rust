@@ -130,8 +130,11 @@ pub async fn run(ctx: Arc<Ctx>, mut inbound: mpsc::Receiver<String>, outbound: m
                     if outbound.send(out).await.is_err() { return; }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    // Slow client: skip; it re-syncs through authoritative timeline fetches.
-                    crate::warn!("session lagged, dropped {n} events");
+                    // A slow or just-resumed client missed events it cannot know about. End the
+                    // session: the app reconnects and re-syncs everything, instead of showing a
+                    // stale chat until it is killed.
+                    crate::warn!("session lagged, dropped {n} events; closing so the client resyncs");
+                    return;
                 }
                 Err(broadcast::error::RecvError::Closed) => return,
             },

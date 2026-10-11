@@ -145,6 +145,11 @@ async fn control_session(ctx: &Arc<Ctx>, cfg: &Config, identity: &Arc<DaemonIden
                     }
                     Some("connected") => {
                         if let Some(id) = msg.get("connectionId").and_then(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+                            // A fresh client connection: any socket we still hold for this id is a
+                            // zombie (e.g. a backgrounded phone that never closed it), so replace it.
+                            if let Some(old) = data.lock().unwrap().remove(&id) {
+                                old.abort();
+                            }
                             ensure_data_socket(ctx, cfg, identity, data, id);
                         }
                     }
@@ -224,6 +229,9 @@ async fn data_socket(ctx: Arc<Ctx>, cfg: &Config, identity: Arc<DaemonIdentity>,
     let (in_tx, in_rx) = tokio::sync::mpsc::channel::<String>(64);
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Arc<str>>(256);
     let session = tokio::spawn(session::run(ctx, in_rx, out_tx, true));
+    let mut last_seen = Instant::now();
+    let mut keepalive = tokio::time::interval(PING_INTERVAL);
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let result = loop {
         tokio::select! {
             out = out_rx.recv() => {
@@ -238,11 +246,25 @@ async fn data_socket(ctx: Arc<Ctx>, cfg: &Config, identity: Arc<DaemonIdentity>,
                     res = sink.feed(Message::Text(channel.encrypt_text(&more))).await;
                     n += 1;
                 }
-                if let Err(e) = res.and(sink.flush().await) {
+                // A dead TCP connection never errors on write: bound the flush so it is noticed.
+                let flushed = match tokio::time::timeout(Duration::from_secs(20), sink.flush()).await {
+                    Ok(r) => r,
+                    Err(_) => break Err("relay write stalled".into()),
+                };
+                if let Err(e) = res.and(flushed) {
                     break Err(e.to_string());
                 }
             }
+            _ = keepalive.tick() => {
+                if last_seen.elapsed() > STALE_AFTER * 6 {
+                    break Err("relay data socket stale".into());
+                }
+                if tokio::time::timeout(Duration::from_secs(10), sink.send(Message::Ping(Vec::new()))).await.is_err() {
+                    break Err("relay ping stalled".into());
+                }
+            }
             frame = stream.next() => {
+                last_seen = Instant::now();
                 let frame = match frame {
                     Some(Ok(f)) => f,
                     Some(Err(e)) => break Err(e.to_string()),

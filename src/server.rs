@@ -60,19 +60,36 @@ async fn ws_upgrade(State(state): State<AppState>, headers: HeaderMap, ws: WebSo
 }
 
 async fn handle_socket(ctx: Arc<Ctx>, socket: WebSocket) {
+    use std::time::{Duration, Instant};
     let (mut sink, mut stream) = socket.split();
     let (in_tx, in_rx) = tokio::sync::mpsc::channel::<String>(64);
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Arc<str>>(256);
     let session = tokio::spawn(session::run(ctx, in_rx, out_tx, false));
+    // Phones drop off the network without closing the socket: ping, and give up
+    // on a connection that neither answers nor writes, so a stale one never
+    // lingers (and the app's reconnect starts clean).
+    let mut last_seen = Instant::now();
+    let mut keepalive = tokio::time::interval(Duration::from_secs(15));
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             out = out_rx.recv() => {
                 let Some(out) = out else { break };
-                if sink.send(Message::Text(out.to_string())).await.is_err() {
+                match tokio::time::timeout(Duration::from_secs(20), sink.send(Message::Text(out.to_string()))).await {
+                    Ok(Ok(())) => {}
+                    _ => break,
+                }
+            }
+            _ = keepalive.tick() => {
+                if last_seen.elapsed() > Duration::from_secs(75) {
+                    break;
+                }
+                if tokio::time::timeout(Duration::from_secs(10), sink.send(Message::Ping(Vec::new()))).await.is_err() {
                     break;
                 }
             }
             frame = stream.next() => {
+                last_seen = Instant::now();
                 let text = match frame {
                     Some(Ok(Message::Text(t))) => t,
                     Some(Ok(Message::Binary(b))) => match String::from_utf8(b) {
