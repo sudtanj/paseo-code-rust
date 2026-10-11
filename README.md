@@ -47,7 +47,7 @@ paseo-lite speaks Paseo's core WebSocket protocol subset with the upstream messa
 - agent controls: `update_agent` (rename, labels), `set_agent_thinking` (`claude --effort` / Codex `effort`),
   `refresh_agent`, `resume_agent`, `list_commands` (built-ins plus `.claude/commands` and `.claude/skills`),
   `wait_for_finish`, `agent.timeline.list_prompts`, `list_provider_features`, `set_agent_feature` (declined);
-- daemon and projects: `daemon.get_status`, `get_daemon_config` (read-only), `diagnostics`,
+- daemon and projects: `daemon.get_status`, `get_daemon_config` / `set_daemon_config` (custom models via `providers.<id>.additionalModels`, `appendSystemPrompt`; saved in `daemon-config.json`), `diagnostics`,
   `project.rename`, `project.remove` / `archive_workspace` (archive the agents and clean up the folder, see below), `workspace.title.set`,
   `workspace.clear_attention`.
 

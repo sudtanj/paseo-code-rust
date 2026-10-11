@@ -184,13 +184,14 @@ impl Manager {
             "list_provider_models_request" => {
                 let provider = s(&msg, "provider").unwrap_or_default();
                 let out = out.clone();
+                let ov = self.daemon_config.overrides();
                 if provider == "codex" && !self.codex_may_start() {
                     // Claude Code holds the machine: answer from the cache, never start Codex.
                     let (models, error) = match self.codex.cached_models() {
                         Some(m) => (m, Value::Null),
                         None => (json!([]), json!("Codex models load the first time Codex runs")),
                     };
-                    reply(&out, json!({ "type": "list_provider_models_response", "payload": { "provider": "codex", "models": crate::snapshot::clean(models), "error": error, "fetchedAt": now_iso(), "requestId": rid } }));
+                    reply(&out, json!({ "type": "list_provider_models_response", "payload": { "provider": "codex", "models": crate::snapshot::clean(ov.merge_models("codex", models)), "error": error, "fetchedAt": now_iso(), "requestId": rid } }));
                 } else if provider == "codex" {
                     let codex = self.codex.clone();
                     tokio::spawn(async move {
@@ -198,10 +199,10 @@ impl Manager {
                             Ok(m) => (m, Value::Null),
                             Err(e) => (json!([]), json!(e)),
                         };
-                        reply(&out, json!({ "type": "list_provider_models_response", "payload": { "provider": "codex", "models": crate::snapshot::clean(models), "error": error, "fetchedAt": now_iso(), "requestId": rid } }));
+                        reply(&out, json!({ "type": "list_provider_models_response", "payload": { "provider": "codex", "models": crate::snapshot::clean(ov.merge_models("codex", models)), "error": error, "fetchedAt": now_iso(), "requestId": rid } }));
                     });
                 } else {
-                    reply(&out, json!({ "type": "list_provider_models_response", "payload": { "provider": provider, "models": claude_models(), "error": null, "fetchedAt": now_iso(), "requestId": rid } }));
+                    reply(&out, json!({ "type": "list_provider_models_response", "payload": { "provider": provider, "models": ov.merge_models("claude", claude_models()), "error": null, "fetchedAt": now_iso(), "requestId": rid } }));
                 }
             }
             "list_provider_modes_request" => {
@@ -443,8 +444,13 @@ impl Manager {
         }
     }
 
+    /// Provider snapshot entries from what is known right now (no fetch).
+    pub(crate) fn provider_entries_now(&self) -> Value {
+        self.provider_entries(self.codex.cached_models())
+    }
+
     fn provider_entries(&self, codex_models: Option<Value>) -> Value {
-        provider_entries(&self.cfg.claude_bin, &self.cfg.codex_bin, codex_models)
+        provider_entries(&self.cfg.claude_bin, &self.cfg.codex_bin, codex_models, &self.daemon_config.overrides())
     }
 
     /// Fetch the Codex model list in the background and push it to every session.
@@ -454,11 +460,11 @@ impl Manager {
         }
         let codex = self.codex.clone();
         let bcast = self.bcast.clone();
-        let (claude_bin, codex_bin) = (self.cfg.claude_bin.clone(), self.cfg.codex_bin.clone());
+        let (claude_bin, codex_bin, ov) = (self.cfg.claude_bin.clone(), self.cfg.codex_bin.clone(), self.daemon_config.overrides());
         tokio::spawn(async move {
             match codex.list_models().await {
                 Ok(models) if models.as_array().map(|m| !m.is_empty()).unwrap_or(false) => {
-                    let entries = provider_entries(&claude_bin, &codex_bin, Some(models));
+                    let entries = provider_entries(&claude_bin, &codex_bin, Some(models), &ov);
                     let _ = bcast.send(wrap(json!({ "type": "providers_snapshot_update", "payload": { "entries": entries, "generatedAt": now_iso() } })));
                 }
                 Ok(_) => crate::warn!("codex returned no models; keeping the default entry"),
@@ -584,17 +590,17 @@ impl Manager {
 
 /// `ProviderSnapshotEntry` list. Codex falls back to a single "Default" model
 /// (Codex's configured model) until its real list has been fetched.
-fn provider_entries(claude_bin: &str, codex_bin: &str, codex_models: Option<Value>) -> Value {
+fn provider_entries(claude_bin: &str, codex_bin: &str, codex_models: Option<Value>, ov: &crate::daemon_config::ProviderOverrides) -> Value {
     let now = now_iso();
     let entry = |provider: &str, label: &str, bin: &str, models: Value| {
         let ok = binary_available(bin);
         json!({
             "provider": provider,
             "status": if ok { "ready" } else { "unavailable" },
-            "enabled": true,
+            "enabled": ov.enabled(provider),
             "source": "builtin",
             "label": label,
-            "models": models,
+            "models": ov.merge_models(provider, models),
             "modes": modes_for(provider),
             "defaultModeId": crate::providers::default_mode(provider),
             "fetchedAt": now,

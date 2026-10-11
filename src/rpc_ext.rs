@@ -45,6 +45,7 @@ impl Manager {
             "agent.timeline.list_prompts.request" => self.list_prompts(&agent_key, rid, out),
             "daemon.get_status.request" => self.daemon_status(rid, out),
             "get_daemon_config_request" => self.daemon_config(rid, out),
+            "set_daemon_config_request" => self.set_daemon_config(msg, rid, out),
             "diagnostics.request" => {
                 reply(out, json!({ "type": "diagnostics.response", "payload": { "requestId": rid, "diagnostic": self.diagnostics() } }));
             }
@@ -384,16 +385,30 @@ impl Manager {
         } }));
     }
 
-    /// Read-only view of the settings upstream's config screen shows; paseo-lite
-    /// is configured through environment variables.
+    /// The app-editable config (custom models, appended prompt; see `daemon_config`).
     fn daemon_config(&self, rid: &str, out: &Out) {
-        reply(out, json!({ "type": "get_daemon_config_response", "payload": { "requestId": rid, "config": {
-            "mcp": { "enabled": false, "injectIntoAgents": false },
-            "hostnames": self.cfg.hostnames,
-            "app": { "baseUrl": self.cfg.app_base_url },
-            "providers": {},
-            "appendSystemPrompt": "",
-        } } }));
+        reply(out, json!({ "type": "get_daemon_config_response", "payload": { "requestId": rid, "config": self.daemon_config.to_json(&self.cfg) } }));
+    }
+
+    /// Apply a config patch, persist it, and push the result: the new config
+    /// to every client and refreshed provider model lists (custom models).
+    fn set_daemon_config(&mut self, msg: &Value, rid: &str, out: &Out) {
+        let patch = msg.get("config").cloned().unwrap_or(Value::Null);
+        self.daemon_config.apply_patch(&patch);
+        let config = self.daemon_config.to_json(&self.cfg);
+        reply(out, json!({ "type": "set_daemon_config_response", "payload": { "requestId": rid, "config": config } }));
+        self.broadcast(json!({ "type": "status", "payload": { "status": "daemon_config_changed", "config": config } }));
+        let entries = self.provider_entries_now();
+        self.broadcast(json!({ "type": "providers_snapshot_update", "payload": { "entries": entries, "generatedAt": now_iso() } }));
+        // The system prompt is a spawn flag for Claude; idle processes restart
+        // on their next prompt, busy ones after their turn.
+        if patch.get("appendSystemPrompt").is_some() {
+            let ids: Vec<String> = self.agents.keys().cloned().collect();
+            for id in ids {
+                self.claude.restart_on_next_prompt(&id);
+            }
+        }
+        crate::log!("daemon config updated");
     }
 
     fn diagnostics(&self) -> String {

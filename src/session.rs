@@ -49,6 +49,7 @@ fn server_info(ctx: &Ctx) -> Arc<str> {
                 "daemonStatusRpc": true,
                 "daemonDiagnostics": true,
                 "pushTokenRevocation": true,
+                "providerRemoval": true,
             },
         } } })
         .to_string(),

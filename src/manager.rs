@@ -109,6 +109,8 @@ pub struct Manager {
     pub push_tokens: crate::push::TokenStore,
     /// Presence per connected client, for in-app vs push notifications.
     pub clients: Vec<Presence>,
+    /// App-editable settings (custom models, appended system prompt).
+    pub daemon_config: crate::daemon_config::DaemonConfig,
 }
 
 /// A client blocked in `wait_for_finish_request` until the agent stops
@@ -145,13 +147,14 @@ impl Manager {
         let projects = store.load_projects();
         let workspaces = store.load_workspaces();
         let push_tokens = crate::push::TokenStore::load(&cfg.home);
+        let daemon_config = crate::daemon_config::DaemonConfig::load(&cfg.home);
         for p in &projects {
             crate::snapshot::set_project_name(&p.root_path, p.custom_name.as_deref());
         }
         crate::log!("loaded {} agents, {} projects, {} workspaces", agents.len(), projects.len(), workspaces.len());
         let claude = ClaudePool::new(cfg.clone(), events_tx.clone());
         let codex = Codex::new(cfg.clone(), events_tx.clone());
-        let mut manager = Manager { cfg, server_id, store, agents, claude, codex, active_cli: None, running: HashSet::new(), cli_queue: VecDeque::new(), claude_warm_at: None, codex_warm_at: None, bcast, events_tx, agents_dirty: false, pairing_url, projects, workspaces, cmds_tx, checkout: crate::checkout::Watcher::start(), started_at: now_iso(), waiters: Vec::new(), push_tokens, clients: Vec::new() };
+        let mut manager = Manager { cfg, server_id, store, agents, claude, codex, active_cli: None, running: HashSet::new(), cli_queue: VecDeque::new(), claude_warm_at: None, codex_warm_at: None, bcast, events_tx, agents_dirty: false, pairing_url, projects, workspaces, cmds_tx, checkout: crate::checkout::Watcher::start(), started_at: now_iso(), waiters: Vec::new(), push_tokens, clients: Vec::new(), daemon_config };
         manager.migrate_agent_workspaces();
         (manager, events_rx)
     }
@@ -398,10 +401,14 @@ impl Manager {
             model: a.rec.model.clone(),
             mode_id: a.rec.mode_id.clone(),
             session_id: a.rec.session_id.clone(),
-            system_prompt: match (self.cfg.default_system_prompt.as_deref(), a.rec.system_prompt.as_deref().filter(|p| !p.trim().is_empty())) {
-                (Some(d), Some(own)) => Some(format!("{d}\n\n{own}")),
-                (Some(d), None) => Some(d.to_string()),
-                (None, own) => own.map(String::from),
+            // Built-in default, then the app's appendSystemPrompt, then the agent's own.
+            system_prompt: {
+                let parts: Vec<String> = [self.cfg.default_system_prompt.clone(), self.daemon_config.append_system_prompt(), a.rec.system_prompt.clone()]
+                    .into_iter()
+                    .flatten()
+                    .filter(|p| !p.trim().is_empty())
+                    .collect();
+                (!parts.is_empty()).then(|| parts.join("\n\n"))
             },
             thinking: a.rec.thinking_option_id.clone(),
         })

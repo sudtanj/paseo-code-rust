@@ -1,6 +1,7 @@
 mod checkout;
 mod cleanup;
 mod config;
+mod daemon_config;
 mod e2ee;
 mod files;
 mod manager;
