@@ -3,7 +3,7 @@ name = "paseo-lite"
 version = "0.1.0"
 edition = "2021"
 description = "Low-resource Rust daemon for Claude Code and Codex agents, compatible with the Paseo relay"
-license = "Apache-2.0"
+license-file = "LICENSE"
 
 [[bin]]
 name = "paseo-lite"

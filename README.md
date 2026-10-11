@@ -140,3 +140,17 @@ src/providers/codex*.rs  shared Codex app-server client + event mapping
 src/store.rs             agents.json + JSONL timelines
 web/index.html           built-in web UI
 ```
+
+## Support the project
+
+paseo-lite is built and maintained by one person in their spare time. If it saves you time or money, you can support continued development:
+
+- **GitHub Sponsors:** https://github.com/sponsors/sudtanj (monthly or one-time)
+- **Star the repo**, report bugs and share it: it helps more than you'd think.
+- **Commercial use, hosted/managed setups, custom features or consulting:** contact [@sudtanj](https://github.com/sudtanj) on GitHub.
+
+## License
+
+Copyright (c) 2025-present Sudono Tanjung, **all rights reserved** for the modifications and original code in this repository. See [LICENSE](LICENSE).
+
+paseo-lite is derived from [Paseo](https://github.com/getpaseo/paseo) (Copyright (c) Mohamed Boudra, Apache-2.0). The upstream-derived portions stay under [Apache-2.0](LICENSE-APACHE), and versions published before the license change remain available under it. See [NOTICE](NOTICE).
