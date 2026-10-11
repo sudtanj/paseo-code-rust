@@ -572,18 +572,21 @@ impl Manager {
 impl Manager {
     const USAGE_SOURCES: [(&'static str, &'static str); 2] = [("claude", "Claude Code"), ("codex", "Codex")];
 
+    /// The provider cards, then one card per model. An agent's view is its
+    /// own provider's card only. `ids` picks cards (a refresh of one card).
     fn usage_entries(&self, agent: Option<&str>, ids: Option<Vec<String>>) -> Vec<Value> {
-        let agent_provider = agent.and_then(|id| self.agents.get(id)).map(|a| a.rec.provider.clone());
-        Self::USAGE_SOURCES
-            .iter()
-            .filter(|(id, _)| match (&agent, &agent_provider) {
-                // An agent's view is its own provider only.
-                (Some(_), Some(p)) => p == *id,
-                (Some(_), None) => false,
-                (None, _) => ids.as_ref().map(|ids: &Vec<String>| ids.iter().any(|i| i == *id)).unwrap_or(true),
-            })
-            .map(|(id, label)| self.usage.report(id, label, agent))
-            .collect()
+        if let Some(agent) = agent {
+            let provider = self.agents.get(agent).map(|a| a.rec.provider.clone());
+            return Self::USAGE_SOURCES.iter().filter(|(id, _)| provider.as_deref() == Some(*id)).map(|(id, label)| self.usage.report(id, label, Some(agent))).collect();
+        }
+        let mut cards: Vec<Value> = Self::USAGE_SOURCES.iter().map(|(id, label)| self.usage.report(id, label, None)).collect();
+        for (id, label) in Self::USAGE_SOURCES {
+            cards.extend(self.usage.model_reports(id, label));
+        }
+        if let Some(ids) = ids {
+            cards.retain(|c| c["id"].as_str().map(|id| ids.iter().any(|i| i == id)).unwrap_or(false));
+        }
+        cards
     }
 
     fn usage_reports(&self, msg: &Value, rid: &str, out: &Out) {

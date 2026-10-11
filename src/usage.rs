@@ -385,8 +385,6 @@ impl Ledger {
 
     /// One `UsageReportEntry` for `provider`; for an agent, its own spend first.
     pub fn report(&self, provider: &str, label: &str, agent_id: Option<&str>) -> Value {
-        let money = |id: &str, label: &str, usd: f64| json!({ "id": id, "label": label, "used": round_usd(usd), "unit": "usd" });
-        let tokens = |id: &str, label: &str, n: u64| json!({ "id": id, "label": label, "used": n, "unit": "tokens" });
         let (today, week, month, all) = (self.sum(provider, 1), self.sum(provider, 7), self.sum(provider, 30), self.sum(provider, 0));
         let mut balances = Vec::new();
         if let Some(id) = agent_id {
@@ -410,19 +408,70 @@ impl Ledger {
             details.push(json!({ "id": format!("model-{model}"), "label": model, "value": format!("{} tok · {}", short(c.tokens()), usd(c.cost)) }));
         }
         details.extend(self.trend(provider, &month));
-        let mut entry = json!({
-            "id": provider,
-            "sourceId": provider,
-            "sourceLabel": label,
-            "account": { "label": "API list prices · days in UTC" },
-            "fetchedAt": crate::util::now_iso(),
-            "report": { "status": "available", "windows": [], "balances": balances, "details": details },
-        });
-        if let Some(svg) = icon(provider) {
-            entry["icon"] = json!(svg);
-        }
-        entry
+        card(provider, label, provider, None, balances, details)
     }
+
+    /// One card per model `provider` has used, most expensive first: cost and
+    /// tokens over 7 / 30 days and all time, with the token split and the
+    /// effective price per million tokens.
+    pub fn model_reports(&self, provider: &str, label: &str) -> Vec<Value> {
+        let (week, month, all) = (self.per_model(provider, 7), self.per_model(provider, 30), self.per_model(provider, 0));
+        let mut models: Vec<(&String, &Counters)> = all.iter().collect();
+        models.sort_by(|a, b| b.1.cost.total_cmp(&a.1.cost).then(b.1.tokens().cmp(&a.1.tokens())));
+        models
+            .into_iter()
+            .map(|(model, a)| {
+                let w = week.get(model).copied().unwrap_or_default();
+                let m = month.get(model).copied().unwrap_or_default();
+                let balances = vec![
+                    money("cost-7d", "Cost, last 7 days", w.cost),
+                    money("cost-30d", "Cost, last 30 days", m.cost),
+                    money("cost-all", "Cost, all time", a.cost),
+                    tokens("tokens-7d", "Tokens, last 7 days", w.tokens()),
+                    tokens("tokens-30d", "Tokens, last 30 days", m.tokens()),
+                    tokens("tokens-all", "Tokens, all time", a.tokens()),
+                ];
+                let mut details = Vec::new();
+                for (id, period, c) in [("7d", "Last 7 days", &w), ("30d", "Last 30 days", &m), ("all", "All time", a)] {
+                    if !c.is_zero() {
+                        details.push(json!({ "id": format!("split-{id}"), "label": period, "value": split(c) }));
+                    }
+                }
+                if a.tokens() > 0 {
+                    details.push(json!({ "id": "per-million", "label": "Effective cost per 1M tokens", "value": usd(a.cost * 1e6 / a.tokens() as f64) }));
+                }
+                card(&format!("{provider}:{model}"), model, provider, Some(label), balances, details)
+            })
+            .collect()
+    }
+}
+
+fn money(id: &str, label: &str, usd: f64) -> Value {
+    json!({ "id": id, "label": label, "used": round_usd(usd), "unit": "usd" })
+}
+
+fn tokens(id: &str, label: &str, n: u64) -> Value {
+    json!({ "id": id, "label": label, "used": n, "unit": "tokens" })
+}
+
+/// A `UsageReportEntry`.
+fn card(id: &str, label: &str, provider: &str, plan: Option<&str>, balances: Vec<Value>, details: Vec<Value>) -> Value {
+    let mut report = json!({ "status": "available", "windows": [], "balances": balances, "details": details });
+    if let Some(plan) = plan {
+        report["planLabel"] = json!(plan);
+    }
+    let mut entry = json!({
+        "id": id,
+        "sourceId": provider,
+        "sourceLabel": label,
+        "account": { "label": "API list prices · days in UTC" },
+        "fetchedAt": crate::util::now_iso(),
+        "report": report,
+    });
+    if let Some(svg) = icon(provider) {
+        entry["icon"] = json!(svg);
+    }
+    entry
 }
 
 fn round_usd(v: f64) -> f64 {
@@ -522,6 +571,15 @@ mod tests {
         assert_eq!(find("projected-month").unwrap(), usd(d.cost * 30.0));
         assert_eq!(find("cache-hit").unwrap(), "40%");
         assert!(find(format!("day-{}", day(0)).as_str()).is_some());
+        // A card per model, with the 7-day / 30-day / all-time numbers.
+        let cards = l.model_reports("codex", "Codex");
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0]["id"], "codex:gpt-test");
+        assert_eq!(cards[0]["sourceLabel"], "gpt-test");
+        assert_eq!(cards[0]["report"]["planLabel"], "Codex");
+        let ids: Vec<&str> = cards[0]["report"]["balances"].as_array().unwrap().iter().map(|b| b["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["cost-7d", "cost-30d", "cost-all", "tokens-7d", "tokens-30d", "tokens-all"]);
+        assert_eq!(cards[0]["report"]["balances"][5]["used"], 1100);
         let _ = std::fs::remove_dir_all(dir);
     }
 

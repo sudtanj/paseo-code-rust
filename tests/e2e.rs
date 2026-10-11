@@ -307,6 +307,9 @@ async fn agent_turn_with_fake_claude() {
     assert_eq!(balance(claude, "tokens-today"), 110, "{claude}");
     assert_eq!(balance(claude, "cost-today").as_f64(), Some(1.0));
     assert!(claude["report"]["details"].as_array().unwrap().iter().any(|d| d["label"] == "claude-test"), "{claude}");
+    let model = reports.iter().find(|r| r["id"] == "claude:claude-test").expect("per-model card");
+    assert_eq!(balance(model, "tokens-all"), 110, "{model}");
+    assert_eq!(balance(model, "cost-7d").as_f64(), Some(1.0));
     // An agent sees its own provider, with its own spend first.
     send(&mut ws, session(json!({ "type": "usage.list_reports.request", "requestId": "u2", "agentId": agent_id }))).await;
     let mine = recv_until(&mut ws, |v| (v["message"]["type"] == "usage.list_reports.update" && v["message"]["payload"]["requestId"] == "u2").then(|| v["message"]["payload"]["report"].clone())).await;
