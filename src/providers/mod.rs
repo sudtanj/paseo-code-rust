@@ -36,6 +36,9 @@ pub enum ProviderEvent {
     Spend { agent_id: String, sample: crate::usage::Sample },
     TurnCompleted { agent_id: String },
     TurnFailed { agent_id: String, error: String },
+    /// The account's usage limit stopped the turn; sent just before its
+    /// TurnFailed. `resets_at` (unix seconds) when the provider said.
+    LimitHit { agent_id: String, resets_at: Option<u64> },
     TurnCanceled { agent_id: String, reason: String },
     /// Process-level exit (Claude) so the pool can free the slot.
     ProcessExited { agent_id: String, generation: u64 },
@@ -182,6 +185,22 @@ pub fn binary_available(bin: &str) -> bool {
         .unwrap_or(false)
 }
 
+
+/// Does an error read like the account's usage limit, which clears by itself
+/// when the window resets? Spend caps and credit balances don't.
+pub fn is_usage_limit(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    if ["spend limit", "usage credits", "credit balance", "budget", "context"].iter().any(|p| t.contains(p)) {
+        return false;
+    }
+    t.contains("usage limit") || t.contains("usagelimitexceeded") || t.contains("limit reached") || ((t.contains("hit your") || t.contains("reached your")) && t.contains("limit"))
+}
+
+/// The reset time in the older "Claude AI usage limit reached|1760000000" text.
+pub fn reset_in_text(text: &str) -> Option<u64> {
+    let (_, tail) = text.rsplit_once('|')?;
+    tail.trim().parse().ok().filter(|t| *t > 1_000_000_000)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,5 +238,19 @@ mod tests {
     fn missing_binary_is_unavailable() {
         assert!(!binary_available("definitely-not-a-real-binary-xyz"));
         assert!(binary_available("/bin/sh") || cfg!(windows));
+    }
+
+    #[test]
+    fn usage_limits_are_told_apart_from_other_limits() {
+        assert!(is_usage_limit("You\u{2019}ve hit your session limit \u{b7} resets 3am (UTC)"));
+        assert!(is_usage_limit("You've hit your usage limit. Upgrade to Plus to continue using Codex"));
+        assert!(is_usage_limit("Claude AI usage limit reached|1760000000"));
+        assert!(is_usage_limit("You've reached your Fable limit."));
+        assert!(!is_usage_limit("You've hit your monthly spend limit"));
+        assert!(!is_usage_limit("Context limit reached \u{b7} /compact or /clear to continue"));
+        assert!(!is_usage_limit("Credit balance is too low"));
+        assert!(!is_usage_limit("API Error: 529 overloaded"));
+        assert_eq!(reset_in_text("Claude AI usage limit reached|1760000000"), Some(1_760_000_000));
+        assert_eq!(reset_in_text("You've hit your session limit"), None);
     }
 }

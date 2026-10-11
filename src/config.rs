@@ -65,6 +65,11 @@ pub struct Config {
     /// A running turn with no output for this long is treated as stuck and
     /// retried (0 = off). Long-running tool calls are exempt.
     pub stall_timeout: Duration,
+    /// When the account's usage limit stops a turn, wait for the reset and
+    /// continue automatically (instead of failing the turn).
+    pub resume_after_limit: bool,
+    /// How often to try again when the limit's reset time is unknown.
+    pub limit_poll: Duration,
     /// What happens to a project's directory when the project is removed.
     pub delete_project_files: crate::cleanup::Policy,
     /// Timelines of agents untouched for this long are dropped from memory.
@@ -141,6 +146,8 @@ impl Config {
             retry_max: env("PASEO_RETRY_MAX").and_then(|v| v.parse().ok()).unwrap_or(3),
             retry_base: env_secs("PASEO_RETRY_BASE_SECS", 5),
             stall_timeout: env_secs("PASEO_STALL_SECS", 600),
+            resume_after_limit: env_bool("PASEO_RESUME_AFTER_LIMIT").unwrap_or(true),
+            limit_poll: env_secs("PASEO_LIMIT_POLL_SECS", 1800).max(Duration::from_secs(1)),
             delete_project_files: crate::cleanup::Policy::parse(env("PASEO_DELETE_PROJECT_FILES").as_deref()),
             timeline_unload: env_secs("PASEO_TIMELINE_UNLOAD_SECS", 600),
             default_system_prompt: match std::env::var("PASEO_DEFAULT_SYSTEM_PROMPT") {

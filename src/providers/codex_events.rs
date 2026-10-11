@@ -7,6 +7,13 @@ use tokio::sync::oneshot;
 
 impl Codex {
     pub(super) fn handle_notification(&self, method: &str, params: &Value) {
+        if method == "account/rateLimits/updated" {
+            // Account-wide, so it names no thread.
+            if let Some(limits) = params.get("rateLimits") {
+                self.inner.state.lock().unwrap().rate_limits = Some(limits.clone());
+            }
+            return;
+        }
         let Some(agent_id) = self.agent_for(params) else { return };
         match method {
             "turn/started" => {
@@ -130,6 +137,12 @@ impl Codex {
                 match s(&turn, "status").as_deref() {
                     Some("failed") => {
                         let error = turn.get("error").and_then(|e| s(e, "message")).unwrap_or_else(|| "turn failed".into());
+                        let info = turn.get("error").and_then(|e| e.get("codexErrorInfo"));
+                        let typed = info.map(|i| i.as_str() == Some("usageLimitExceeded") || i.get("usageLimitExceeded").is_some()).unwrap_or(false);
+                        if typed || crate::providers::is_usage_limit(&error) {
+                            let resets_at = self.inner.state.lock().unwrap().rate_limits.as_ref().and_then(exhausted_reset);
+                            self.emit(ProviderEvent::LimitHit { agent_id: agent_id.clone(), resets_at });
+                        }
                         self.emit(ProviderEvent::TurnFailed { agent_id, error });
                     }
                     Some("interrupted") => self.emit(ProviderEvent::TurnCanceled { agent_id, reason: "interrupted".into() }),
@@ -192,5 +205,30 @@ impl Codex {
             let mut st = this.inner.state.lock().unwrap();
             st.open_approvals = st.open_approvals.saturating_sub(1);
         });
+    }
+}
+
+/// When the used-up rate-limit window resets (unix seconds): the latest of
+/// the windows at 100%, since all of them must clear.
+fn exhausted_reset(limits: &Value) -> Option<u64> {
+    ["primary", "secondary"]
+        .iter()
+        .filter_map(|k| limits.get(*k))
+        .filter(|w| w.get("usedPercent").and_then(|p| p.as_f64()).unwrap_or(0.0) >= 100.0)
+        .filter_map(|w| w.get("resetsAt").and_then(|t| t.as_u64()))
+        .max()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_comes_from_the_used_up_window() {
+        let limits = json!({ "primary": { "usedPercent": 100.0, "windowDurationMins": 300, "resetsAt": 1_760_000_000u64 }, "secondary": { "usedPercent": 40.0, "resetsAt": 1_760_500_000u64 } });
+        assert_eq!(exhausted_reset(&limits), Some(1_760_000_000));
+        let both = json!({ "primary": { "usedPercent": 100, "resetsAt": 1_760_000_000u64 }, "secondary": { "usedPercent": 100, "resetsAt": 1_760_500_000u64 } });
+        assert_eq!(exhausted_reset(&both), Some(1_760_500_000));
+        assert_eq!(exhausted_reset(&json!({ "primary": { "usedPercent": 20, "resetsAt": 1 } })), None);
     }
 }

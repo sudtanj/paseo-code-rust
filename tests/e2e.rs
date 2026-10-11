@@ -69,10 +69,26 @@ done
         stream.push_str(&format!("      printf '%s\\n' '{{\"type\":\"stream_event\",\"event\":{{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"w{i} \"}}}}}}'\n"));
     }
     stream.push_str("      printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'\n      ;;\n  esac\ndone\n");
+    // Refused by the usage limit the first time (state kept next to the script,
+    // since the daemon restarts the CLI), answered normally after that.
+    let limit = format!(
+        concat!(
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"type\":\"user\"'*)\n",
+            "      if [ ! -e '{marker}' ]; then\n        : > '{marker}'\n",
+            "        printf '%s\\n' '{{\"type\":\"rate_limit_event\",\"rate_limit_info\":{{\"status\":\"rejected\",\"resetsAt\":1,\"rateLimitType\":\"five_hour\"}}}}'\n",
+            "        printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"result\":\"Session limit reached\"}}'\n",
+            "      else\n",
+            "        printf '%s\\n' '{{\"type\":\"assistant\",\"message\":{{\"id\":\"m1\",\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"back to work\"}}]}}}}'\n",
+            "        printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}}'\n",
+            "      fi\n      ;;\n  esac\ndone\n"
+        ),
+        marker = dir.join("limit-hit").display()
+    );
     let body = match mode {
         "hang" => hanging.to_string(),
         "tool" => tool.to_string(),
         "stream" => stream,
+        "limit" => limit,
         _ => script.to_string(),
     };
     std::fs::write(&path, body).unwrap();
@@ -100,6 +116,7 @@ fn start_at(dir: PathBuf, password: Option<&str>, mode: &str) -> Daemon {
         .env("PASEO_CODEX_BIN", "/nonexistent/codex")
         .env("PASEO_DEFAULT_SYSTEM_PROMPT", "")
         .env("PASEO_RETRY_MAX", "0")
+        .env("PASEO_LIMIT_POLL_SECS", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -602,4 +619,34 @@ async fn streamed_text_is_sent_in_batches() {
     let rows: Vec<&Value> = tail["entries"].as_array().unwrap().iter().filter(|e| e["item"]["type"] == "assistant_message").collect();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["item"]["text"], expected);
+}
+
+#[tokio::test]
+async fn usage_limit_waits_and_continues() {
+    let d = start_at(unique_dir("limit"), None, "limit");
+    let cwd = d.dir.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    send(
+        &mut ws,
+        session(json!({ "type": "create_agent_request", "requestId": "l1", "config": { "provider": "claude", "cwd": cwd.to_string_lossy(), "modeId": "bypassPermissions" }, "initialPrompt": "build it" })),
+    )
+    .await;
+    // The limit is announced, then the same turn carries on and completes: never fails.
+    let mut noted = false;
+    recv_until(&mut ws, |v| {
+        let ev = &v["message"]["payload"]["event"];
+        if v["message"]["type"] != "agent_stream" {
+            return None;
+        }
+        assert_ne!(ev["type"], "turn_failed", "{ev}");
+        if ev["type"] == "timeline" && ev["item"]["type"] == "notification" {
+            noted |= ev["item"]["message"].as_str().unwrap_or("").starts_with("Usage limit reached");
+        }
+        (ev["type"] == "turn_completed").then_some(())
+    })
+    .await;
+    assert!(noted, "the wait was not announced");
+    assert!(d.dir.join("limit-hit").exists());
 }

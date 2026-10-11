@@ -57,6 +57,7 @@ fn other_event_agent(ev: &ProviderEvent) -> Option<&str> {
         | ProviderEvent::Spend { agent_id, .. }
         | ProviderEvent::TurnCompleted { agent_id }
         | ProviderEvent::TurnFailed { agent_id, .. }
+        | ProviderEvent::LimitHit { agent_id, .. }
         | ProviderEvent::TurnCanceled { agent_id, .. }
         | ProviderEvent::ProcessExited { agent_id, .. } => Some(agent_id),
     }
@@ -108,6 +109,12 @@ pub struct Agent {
     /// A retry is scheduled: when to re-dispatch and with which prompt.
     pub retry_at: Option<Instant>,
     pub retry_text: String,
+    /// The provider reported the usage limit for the running turn (reset time when known).
+    pub limit_hit: Option<Option<u64>>,
+    /// The scheduled retry is a wait for the usage limit to reset.
+    pub limit_wait: bool,
+    /// When the running turn first hit the usage limit.
+    pub limit_since: Option<Instant>,
 }
 
 pub struct Manager {
@@ -514,6 +521,11 @@ impl Manager {
             agent.rec.archived_at = None;
         }
         if agent.status == "running" {
+            if agent.limit_wait && agent.retry_at.is_some() {
+                // Waiting for the usage limit: a new message means "try now".
+                // If the limit still holds, the wait is simply rescheduled.
+                agent.retry_at = Some(Instant::now());
+            }
             agent.queue.push_back((text, message_id));
             self.persist_pending(agent_id);
             return Ok(());
@@ -535,6 +547,9 @@ impl Manager {
             agent.attempts = 0;
             agent.produced = false;
             agent.retry_at = None;
+            agent.limit_hit = None;
+            agent.limit_wait = false;
+            agent.limit_since = None;
             agent.last_event = Instant::now();
             agent.active_turn = Some((turn_id.clone(), now_iso()));
             agent.rec.last_user_message_at = Some(now_iso());
@@ -713,6 +728,15 @@ impl Manager {
             other => other,
         };
         if !compacting {
+            if let Err(e) = &outcome {
+                let hit = self.agents.get_mut(agent_id).and_then(|a| a.limit_hit.take());
+                if self.cfg.resume_after_limit && (hit.is_some() || crate::providers::is_usage_limit(e)) {
+                    let resets_at = hit.flatten().or_else(|| crate::providers::reset_in_text(e));
+                    if self.schedule_limit_wait(agent_id, resets_at) {
+                        return;
+                    }
+                }
+            }
             if let Some(reason) = self.retry_reason(agent_id, &outcome) {
                 if self.schedule_retry(agent_id, &reason) {
                     return;
@@ -846,6 +870,9 @@ impl Manager {
             a.produced = produced;
             a.compacting = false;
             a.retry_at = None;
+            a.limit_hit = None;
+            a.limit_wait = false;
+            a.limit_since = None;
             a.last_event = Instant::now();
             let provider = a.rec.provider.clone();
             let turn_id = a.active_turn.as_ref().map(|t| t.0.clone());
@@ -893,13 +920,52 @@ impl Manager {
         let attempt = a.attempts;
         let delay = (base * 2u32.saturating_pow(attempt - 1)).min(Duration::from_secs(60));
         a.retry_at = Some(Instant::now() + delay);
+        a.limit_wait = false;
         // Output already streamed stays in the conversation: ask the model to
         // pick up from there. With nothing produced, resend the prompt.
         a.retry_text = if a.produced { CONTINUE_PROMPT.to_string() } else { a.turn_text.clone() };
+        crate::warn!("agent {agent_id}: {reason}; retry {attempt}/{max} in {}s", delay.as_secs());
+        let note = json!({ "type": "notification", "level": "warning", "message": format!("Something went wrong ({}). Retrying automatically in {}s (attempt {attempt} of {max})", crate::util::truncate(reason, 160), delay.as_secs()) });
+        self.park_turn(agent_id, note);
+        true
+    }
+
+    /// The account's usage limit stopped the turn: keep it open, wait until
+    /// the limit resets (or poll when the reset time is unknown), then carry
+    /// on. Queued messages run after it. False when the wait would be too
+    /// long; the failure is then reported as usual.
+    fn schedule_limit_wait(&mut self, agent_id: &str, resets_at: Option<u64>) -> bool {
+        let now = unix_now();
+        let (delay, known) = match resets_at {
+            Some(t) if t > now => (Duration::from_secs(t - now) + LIMIT_GRACE, true),
+            _ => (self.cfg.limit_poll, false),
+        };
+        let Some(a) = self.agents.get_mut(agent_id) else { return false };
+        let since = *a.limit_since.get_or_insert_with(Instant::now);
+        if since.elapsed() + delay > LIMIT_MAX_WAIT {
+            crate::warn!("agent {agent_id}: usage limit resets too far out ({}); not waiting", wait_text(delay));
+            return false;
+        }
+        a.retry_at = Some(Instant::now() + delay);
+        a.limit_wait = true;
+        a.retry_text = if a.produced { LIMIT_PROMPT.to_string() } else { a.turn_text.clone() };
+        let message = if known {
+            format!("Usage limit reached. Continuing automatically at {} (in {}). Send a message to try sooner, or stop to cancel.", reset_text(now + delay.as_secs()), wait_text(delay))
+        } else {
+            format!("Usage limit reached. Trying again in {}. Send a message to try sooner, or stop to cancel.", wait_text(delay))
+        };
+        crate::log!("agent {agent_id}: usage limit; continuing in {}", wait_text(delay));
+        self.park_turn(agent_id, json!({ "type": "notification", "level": "warning", "message": message }));
+        true
+    }
+
+    /// Keep the turn open while the failed attempt is torn down: free its CLI
+    /// slot, deny its open permission requests and note why in the chat.
+    fn park_turn(&mut self, agent_id: &str, note: Value) {
+        let Some(a) = self.agents.get_mut(agent_id) else { return };
         // Dropping the reply senders makes providers deny outstanding requests.
         a.permissions.clear();
         let provider = a.rec.provider.clone();
-        crate::warn!("agent {agent_id}: {reason}; retry {attempt}/{max} in {}s", delay.as_secs());
         // A clean slate: a fresh CLI process resumes the session; Codex's turn is interrupted.
         self.running.remove(agent_id);
         self.cli_queue.retain(|(id, _)| id != agent_id);
@@ -908,11 +974,9 @@ impl Manager {
         } else {
             self.claude.stop(agent_id);
         }
-        let note = json!({ "type": "notification", "level": "warning", "message": format!("Something went wrong ({}). Retrying automatically in {}s (attempt {attempt} of {max})", crate::util::truncate(reason, 160), delay.as_secs()) });
         self.append_item(agent_id, note);
         self.publish_agent(agent_id);
         self.pump();
-        true
     }
 
     /// Housekeeping: re-dispatch due retries and unstick silent turns.
@@ -922,6 +986,7 @@ impl Manager {
         for (id, text) in due {
             if let Some(a) = self.agents.get_mut(&id) {
                 a.retry_at = None;
+                a.limit_wait = false;
                 a.last_event = Instant::now();
             }
             self.dispatch(&id, text);
@@ -1046,6 +1111,11 @@ impl Manager {
             }
             ProviderEvent::TurnCompleted { agent_id } => self.finish_turn(&agent_id, Ok(None)),
             ProviderEvent::TurnCanceled { agent_id, reason } => self.finish_turn(&agent_id, Ok(Some(reason))),
+            ProviderEvent::LimitHit { agent_id, resets_at } => {
+                if let Some(a) = self.agents.get_mut(&agent_id).filter(|a| a.status == "running" && a.retry_at.is_none()) {
+                    a.limit_hit = Some(resets_at);
+                }
+            }
             ProviderEvent::TurnFailed { agent_id, error } => self.finish_turn(&agent_id, Err(error)),
             ProviderEvent::ProcessExited { agent_id, generation } => {
                 let (current, ready) = self.claude.process_exited(&agent_id, generation);
@@ -1177,7 +1247,7 @@ impl Manager {
 
 impl Agent {
     pub fn new(rec: AgentRecord) -> Agent {
-        Agent { rec, status: "idle", active_turn: None, queue: VecDeque::new(), permissions: Vec::new(), timeline: None, dirty_rows: BTreeSet::new(), last_touch: Instant::now(), compacting: false, turn_text: String::new(), attempts: 0, produced: false, last_event: Instant::now(), retry_at: None, retry_text: String::new() }
+        Agent { rec, status: "idle", active_turn: None, queue: VecDeque::new(), permissions: Vec::new(), timeline: None, dirty_rows: BTreeSet::new(), last_touch: Instant::now(), compacting: false, turn_text: String::new(), attempts: 0, produced: false, last_event: Instant::now(), retry_at: None, retry_text: String::new(), limit_hit: None, limit_wait: false, limit_since: None }
     }
 
     pub fn ensure_timeline(&mut self, store: &Store) {
@@ -1208,6 +1278,15 @@ const CONTINUE_PROMPT: &str = "Your previous response was interrupted unexpected
 /// Sent when the daemon restarted in the middle of a turn that had already produced output.
 const RESUME_PROMPT: &str = "The server was restarted while you were working, which interrupted your previous response. Continue from where you left off and finish the task.";
 
+/// After a usage limit resets, wait a little longer before continuing, so the
+/// first request doesn't race the reset.
+const LIMIT_GRACE: Duration = Duration::from_secs(60);
+/// Give up waiting for a usage limit after this long (weekly limits included).
+const LIMIT_MAX_WAIT: Duration = Duration::from_secs(8 * 24 * 3600);
+
+/// Sent when the usage limit has reset and a turn it stopped carries on.
+const LIMIT_PROMPT: &str = "Your usage limit has reset. Continue from where you left off and finish the task.";
+
 /// Transient failures are retried; auth, quota and setup problems won't fix
 /// themselves, so those surface immediately.
 fn retryable_error(error: &str) -> bool {
@@ -1218,9 +1297,39 @@ fn retryable_error(error: &str) -> bool {
     !PERMANENT.iter().any(|p| e.contains(p))
 }
 
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// "2026-10-12 03:01 UTC"
+fn reset_text(unix: u64) -> String {
+    let at = std::time::UNIX_EPOCH + Duration::from_secs(unix);
+    let iso = humantime::format_rfc3339_seconds(at).to_string();
+    format!("{} UTC", iso.get(..16).unwrap_or(&iso).replace('T', " "))
+}
+
+/// "2h 14m", "3d 4h", "45m"
+fn wait_text(d: Duration) -> String {
+    let m = (d.as_secs() + 59) / 60;
+    match (m / 1440, m % 1440 / 60, m % 60) {
+        (0, 0, m) => format!("{m}m"),
+        (0, h, m) => format!("{h}h {m}m"),
+        (d, h, _) => format!("{d}d {h}h"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn limit_wait_is_described_plainly() {
+        assert_eq!(reset_text(1_760_000_000), "2025-10-09 08:53 UTC");
+        assert_eq!(wait_text(Duration::from_secs(59)), "1m");
+        assert_eq!(wait_text(Duration::from_secs(45 * 60)), "45m");
+        assert_eq!(wait_text(Duration::from_secs(2 * 3600 + 14 * 60)), "2h 14m");
+        assert_eq!(wait_text(Duration::from_secs(3 * 86400 + 4 * 3600)), "3d 4h");
+    }
 
     #[test]
     fn transient_errors_are_retryable() {

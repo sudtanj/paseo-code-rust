@@ -21,6 +21,10 @@ pub struct StreamState {
     current_message: Option<String>,
     /// Context window occupancy after the latest API call.
     context_tokens: Option<u64>,
+    /// Latest `rate_limit_event` info of the running turn.
+    limit_info: Option<Value>,
+    /// The turn was refused by the usage limit (`api_error: usage_limit_reached`), with its reset when given.
+    limit_refused: Option<Option<u64>>,
 }
 
 fn s(v: &Value, key: &str) -> Option<String> {
@@ -29,7 +33,7 @@ fn s(v: &Value, key: &str) -> Option<String> {
 
 impl StreamState {
     pub fn new(agent_id: String, events: EventTx, stdin: mpsc::UnboundedSender<String>, interrupted: Arc<AtomicBool>, session_id: Option<String>) -> Self {
-        StreamState { agent_id, events, stdin, interrupted, session_id, tools: HashMap::new(), streamed: HashSet::new(), current_message: None, context_tokens: None }
+        StreamState { agent_id, events, stdin, interrupted, session_id, tools: HashMap::new(), streamed: HashSet::new(), current_message: None, context_tokens: None, limit_info: None, limit_refused: None }
     }
 
     fn emit(&self, ev: ProviderEvent) {
@@ -69,6 +73,7 @@ impl StreamState {
             "stream_event" if !is_sidechain => self.handle_stream_event(msg.get("event").unwrap_or(&Value::Null)),
             "assistant" if !is_sidechain => self.handle_assistant(&msg),
             "user" if !is_sidechain => self.handle_tool_results(&msg),
+            "rate_limit_event" => self.limit_info = msg.get("rate_limit_info").cloned(),
             "result" => self.handle_result(&msg),
             "control_request" => self.handle_control_request(&msg),
             _ => {}
@@ -99,6 +104,9 @@ impl StreamState {
     }
 
     fn handle_assistant(&mut self, msg: &Value) {
+        if s(msg, "api_error").as_deref() == Some("usage_limit_reached") {
+            self.limit_refused = Some(msg.pointer("/api_error_params/rate_limit_info/resetsAt").and_then(|v| v.as_u64()));
+        }
         let message = msg.get("message").unwrap_or(&Value::Null);
         // Each API call reports the full prompt it was sent, so the latest one
         // is how much of the context window the conversation now occupies.
@@ -184,20 +192,43 @@ impl StreamState {
         }
         self.streamed.clear();
         let ok = s(msg, "subtype").as_deref() == Some("success") && !msg.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
-        if self.interrupted.swap(false, Ordering::SeqCst) {
-            self.emit(ProviderEvent::TurnCanceled { agent_id, reason: "interrupted".into() });
-        } else if ok {
-            self.emit(ProviderEvent::TurnCompleted { agent_id });
-        } else {
-            let error = msg
-                .get("errors")
+        let error = || {
+            msg.get("errors")
                 .and_then(|e| e.as_array())
                 .map(|e| e.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join("; "))
                 .filter(|e| !e.is_empty())
                 .or_else(|| s(msg, "result"))
-                .unwrap_or_else(|| s(msg, "subtype").unwrap_or_else(|| "turn failed".into()));
-            self.emit(ProviderEvent::TurnFailed { agent_id, error });
+                .unwrap_or_else(|| s(msg, "subtype").unwrap_or_else(|| "turn failed".into()))
+        };
+        let limit = self.usage_limit(msg, ok, &error());
+        if self.interrupted.swap(false, Ordering::SeqCst) {
+            self.emit(ProviderEvent::TurnCanceled { agent_id, reason: "interrupted".into() });
+        } else if let Some(resets_at) = limit {
+            self.emit(ProviderEvent::LimitHit { agent_id: agent_id.clone(), resets_at });
+            self.emit(ProviderEvent::TurnFailed { agent_id, error: error() });
+        } else if ok {
+            self.emit(ProviderEvent::TurnCompleted { agent_id });
+        } else {
+            self.emit(ProviderEvent::TurnFailed { agent_id, error: error() });
         }
+    }
+
+    /// Did the usage limit end this turn? Some(reset time, when known).
+    /// Claude says so in a typed field, a `rejected` rate-limit event or, on
+    /// older builds, only in the reply text (sometimes on a "successful" result).
+    fn usage_limit(&mut self, msg: &Value, ok: bool, error: &str) -> Option<Option<u64>> {
+        let refused = self.limit_refused.take();
+        let info = self.limit_info.take();
+        let rejected = info.filter(|i| s(i, "status").as_deref() == Some("rejected"));
+        let text = s(msg, "result").unwrap_or_default();
+        let lead = text.trim_start().to_ascii_lowercase();
+        let says_so = text.len() < 300 && (lead.starts_with("you") || lead.starts_with("claude ai usage limit")) && super::is_usage_limit(&text);
+        let hit = refused.is_some() || (!ok && (rejected.is_some() || super::is_usage_limit(error))) || (ok && says_so);
+        if !hit {
+            return None;
+        }
+        let event_reset = rejected.as_ref().and_then(|i| i.get("resetsAt")).and_then(|v| v.as_u64());
+        Some(refused.flatten().or(event_reset).or_else(|| super::reset_in_text(&text)).or_else(|| super::reset_in_text(error)))
     }
 
     fn handle_control_request(&mut self, msg: &Value) {
@@ -243,5 +274,62 @@ impl StreamState {
             let resp = json!({ "type": "control_response", "response": { "subtype": "success", "request_id": request_id, "response": inner } });
             let _ = stdin.send(resp.to_string());
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(lines: &[Value]) -> Vec<ProviderEvent> {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (stdin, _keep) = mpsc::unbounded_channel();
+        let mut st = StreamState::new("a1".into(), tx, stdin, Arc::new(AtomicBool::new(false)), Some("s1".into()));
+        for line in lines {
+            st.handle_line(&line.to_string());
+        }
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    fn limit_of(events: &[ProviderEvent]) -> Option<Option<u64>> {
+        events.iter().find_map(|e| match e {
+            ProviderEvent::LimitHit { resets_at, .. } => Some(*resets_at),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn usage_limit_is_reported_with_its_reset() {
+        let events = run(&[
+            json!({ "type": "rate_limit_event", "rate_limit_info": { "status": "rejected", "resetsAt": 1_760_000_000u64, "rateLimitType": "five_hour" } }),
+            json!({ "type": "result", "subtype": "success", "is_error": true, "result": "You've hit your session limit \u{b7} resets 3am (UTC)" }),
+        ]);
+        assert_eq!(limit_of(&events), Some(Some(1_760_000_000)));
+        assert!(events.iter().any(|e| matches!(e, ProviderEvent::TurnFailed { .. })));
+
+        let refused = run(&[
+            json!({ "type": "assistant", "api_error": "usage_limit_reached", "api_error_params": { "rate_limit_info": { "status": "rejected", "resetsAt": 1_770_000_000u64 } }, "message": { "content": [] } }),
+            json!({ "type": "result", "subtype": "success", "is_error": true, "result": "limit" }),
+        ]);
+        assert_eq!(limit_of(&refused), Some(Some(1_770_000_000)));
+
+        let legacy = run(&[json!({ "type": "result", "subtype": "success", "result": "Claude AI usage limit reached|1760000000" })]);
+        assert_eq!(limit_of(&legacy), Some(Some(1_760_000_000)));
+    }
+
+    #[test]
+    fn other_results_are_not_limits() {
+        let ok = run(&[
+            json!({ "type": "rate_limit_event", "rate_limit_info": { "status": "allowed_warning", "resetsAt": 1_760_000_000u64 } }),
+            json!({ "type": "result", "subtype": "success", "result": "Done. The tests pass." }),
+        ]);
+        assert_eq!(limit_of(&ok), None);
+        assert!(ok.iter().any(|e| matches!(e, ProviderEvent::TurnCompleted { .. })));
+        let failed = run(&[json!({ "type": "result", "subtype": "error_during_execution", "is_error": true, "result": "API Error: 529 overloaded" })]);
+        assert_eq!(limit_of(&failed), None);
     }
 }

@@ -45,6 +45,8 @@ struct State {
     open_approvals: usize,
     last_activity: Option<Instant>,
     models: Option<Value>,
+    /// Latest `account/rateLimits/updated` snapshot, for when a limit is hit.
+    rate_limits: Option<Value>,
     /// Set while another CLI is active: nothing may start the app-server.
     blocked: bool,
 }
