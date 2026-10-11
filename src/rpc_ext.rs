@@ -525,7 +525,7 @@ impl Manager {
 
     /// Archive a workspace and its agents. When that was the project's last
     /// workspace, the project goes too and its local folder is cleaned up.
-    fn archive_workspace_request(&mut self, msg: &Value, rid: &str, out: &Out) {
+    pub(crate) fn archive_workspace_request(&mut self, msg: &Value, rid: &str, out: &Out) {
         let id = s(msg, "workspaceId").unwrap_or_default();
         let root = self.workspaces.iter().find(|w| w.id == id).map(|w| w.project_root.clone());
         let at = match self.archive_workspace(&id) {
