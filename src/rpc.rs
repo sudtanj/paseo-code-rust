@@ -557,18 +557,33 @@ impl Manager {
                 let end = rows.iter().position(|r| r.seq_start >= c).unwrap_or(n);
                 (if limit == 0 { 0 } else { end.saturating_sub(limit) }, end)
             }
+            // A row is updated in place (tool call running -> completed, streamed
+            // text chunks), keeping its seqStart while seqEnd grows. Catching up
+            // must return every row that changed after the cursor, not only rows
+            // that started after it, or a backgrounded app never sees the update.
             ("after", Some(c)) => {
-                let start = rows.iter().position(|r| r.seq_start > c).unwrap_or(n);
-                (start, if limit == 0 { n } else { (start + limit).min(n) })
+                let changed: Vec<usize> = rows.iter().enumerate().filter(|(_, r)| r.seq_end > c).map(|(i, _)| i).collect();
+                match changed.first() {
+                    None => (n, n),
+                    Some(&first) => {
+                        let take = if limit == 0 { changed.len() } else { limit.min(changed.len()) };
+                        (first, changed[take - 1] + 1)
+                    }
+                }
             }
             _ => (if limit == 0 { 0 } else { n.saturating_sub(limit) }, n),
         };
         let provider = agent.rec.provider.clone();
         let entries: Vec<Value> = rows[start..end].iter().map(|r| timeline_entry(&provider, r)).collect();
         let min_seq = rows.first().map(|r| r.seq_start).unwrap_or(0);
-        let max_seq = rows.last().map(|r| r.seq_end).unwrap_or(0);
+        // Rows updated in place can end later than rows after them.
+        let max_seq = rows.iter().map(|r| r.seq_end).max().unwrap_or(0);
         let start_cursor = rows.get(start).filter(|_| start < end).map(|r| cursor(r.seq_start));
-        let end_cursor = if end > start { Some(cursor(rows[end - 1].seq_end)) } else { None };
+        let end_cursor = rows[start..end].iter().map(|r| r.seq_end).max().map(cursor);
+        let has_newer = match (direction.as_str(), cursor_seq) {
+            ("after", Some(c)) => rows[end..].iter().any(|r| r.seq_end > c),
+            _ => end < n,
+        };
         let payload = json!({
             "requestId": rid,
             "agentId": id,
@@ -583,7 +598,7 @@ impl Manager {
             "startCursor": start_cursor,
             "endCursor": end_cursor,
             "hasOlder": start > 0,
-            "hasNewer": end < n,
+            "hasNewer": has_newer,
             "entries": entries,
             "error": null,
         });

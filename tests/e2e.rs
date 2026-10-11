@@ -38,8 +38,8 @@ fn unique_dir(tag: &str) -> PathBuf {
 
 /// A stand-in for `claude -p --input-format stream-json`: answers every user
 /// message with one assistant message and a successful result.
-fn fake_claude(dir: &std::path::Path, hang: bool) -> PathBuf {
-    let path = dir.join(if hang { "fake-claude-hang.sh" } else { "fake-claude.sh" });
+fn fake_claude(dir: &std::path::Path, mode: &str) -> PathBuf {
+    let path = dir.join(format!("fake-claude-{mode}.sh"));
     let script = r#"#!/bin/sh
 while IFS= read -r line; do
   case "$line" in
@@ -51,7 +51,21 @@ while IFS= read -r line; do
 done
 "#;
     let hanging = "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"type\":\"user\"'*) sleep 600 ;;\n  esac\ndone\n";
-    std::fs::write(&path, if hang { hanging } else { script }).unwrap();
+    // One tool call (running, then its result), then text: exercises rows updated in place.
+    let tool = concat!(
+        "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"type\":\"user\"'*)\n",
+        "      printf '%s\\n' '{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"Bash\",\"input\":{\"command\":\"ls\"}}]}}'\n",
+        "      printf '%s\\n' '{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_1\",\"content\":\"file.txt\"}]}}'\n",
+        "      printf '%s\\n' '{\"type\":\"assistant\",\"message\":{\"id\":\"m2\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}'\n",
+        "      printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'\n",
+        "      ;;\n  esac\ndone\n"
+    );
+    let body = match mode {
+        "hang" => hanging.to_string(),
+        "tool" => tool.to_string(),
+        _ => script.to_string(),
+    };
+    std::fs::write(&path, body).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -61,14 +75,14 @@ done
 }
 
 fn start(tag: &str, password: Option<&str>) -> Daemon {
-    start_at(unique_dir(tag), password, false)
+    start_at(unique_dir(tag), password, "ok")
 }
 
 /// Start (or restart) the daemon on an existing directory. `hang`: the fake
 /// claude accepts a prompt and never answers, to simulate a turn in flight.
-fn start_at(dir: PathBuf, password: Option<&str>, hang: bool) -> Daemon {
+fn start_at(dir: PathBuf, password: Option<&str>, mode: &str) -> Daemon {
     let port = free_port();
-    let claude = fake_claude(&dir, hang);
+    let claude = fake_claude(&dir, mode);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_paseo-lite"));
     cmd.args(["--listen", &format!("127.0.0.1:{port}"), "--no-relay"])
         .env("PASEO_LITE_HOME", dir.join("home"))
@@ -367,7 +381,7 @@ async fn interrupted_turn_resumes_after_hard_kill() {
     std::fs::create_dir_all(&cwd).unwrap();
 
     // First life: the "model" takes the prompt and never answers.
-    let mut first = start_at(dir.clone(), None, true);
+    let mut first = start_at(dir.clone(), None, "hang");
     let mut ws = connect(first.port).await;
     hello(&mut ws, None).await;
     send(
@@ -396,7 +410,7 @@ async fn interrupted_turn_resumes_after_hard_kill() {
     std::mem::forget(first); // keep the directory: it is the "volume"
 
     // Second life: a working model. The daemon resumes the turn on its own.
-    let second = start_at(dir, None, false);
+    let second = start_at(dir, None, "ok");
     let mut ws = connect(second.port).await;
     hello(&mut ws, None).await;
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -411,4 +425,47 @@ async fn interrupted_turn_resumes_after_hard_kill() {
     };
     let texts: Vec<String> = tl["entries"].as_array().unwrap().iter().filter(|e| e["item"]["type"] == "notification").map(|e| e["item"]["message"].as_str().unwrap().to_string()).collect();
     assert!(texts.iter().any(|t| t.contains("restarted")), "{texts:?}");
+}
+
+/// An app that was in the background catches up with `direction: "after"`.
+/// A tool call row is created "running" and later updated in place to
+/// "completed": catching up from a cursor at its start must return the update.
+#[tokio::test]
+async fn catch_up_returns_rows_updated_in_place() {
+    let d = start_at(unique_dir("catchup"), None, "tool");
+    let cwd = d.dir.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    send(
+        &mut ws,
+        session(json!({ "type": "create_agent_request", "requestId": "c1", "config": { "provider": "claude", "cwd": cwd.to_string_lossy(), "modeId": "bypassPermissions" }, "initialPrompt": "list files" })),
+    )
+    .await;
+    let agent_id = recv_until(&mut ws, |v| {
+        let p = &v["message"]["payload"];
+        (v["message"]["type"] == "status" && p["status"] == "agent_created").then(|| p["agentId"].as_str().unwrap().to_string())
+    })
+    .await;
+    recv_until(&mut ws, |v| (v["message"]["type"] == "agent_stream" && v["message"]["payload"]["event"]["type"] == "turn_completed").then_some(())).await;
+
+    let tail = rpc(&mut ws, json!({ "type": "fetch_agent_timeline_request", "requestId": "c2", "agentId": agent_id, "direction": "tail", "limit": 50 }), "fetch_agent_timeline_response").await;
+    let tool = tail["entries"].as_array().unwrap().iter().find(|e| e["item"]["type"] == "tool_call").cloned().expect("tool call row");
+    assert_eq!(tool["item"]["status"], "completed");
+    let start = tool["seqStart"].as_u64().unwrap();
+    assert!(tool["seqEnd"].as_u64().unwrap() > start, "the row was updated in place: {tool}");
+
+    // The app last saw the row when it was created (cursor = its seqStart).
+    let after = rpc(
+        &mut ws,
+        json!({ "type": "fetch_agent_timeline_request", "requestId": "c3", "agentId": agent_id, "direction": "after", "cursor": { "epoch": tail["epoch"], "seq": start }, "limit": 50 }),
+        "fetch_agent_timeline_response",
+    )
+    .await;
+    let entries = after["entries"].as_array().unwrap();
+    let updated = entries.iter().find(|e| e["item"]["type"] == "tool_call").expect("updated tool call must be returned");
+    assert_eq!(updated["item"]["status"], "completed");
+    assert!(entries.iter().any(|e| e["item"]["type"] == "assistant_message"));
+    assert_eq!(after["hasNewer"], false);
+    assert_eq!(after["endCursor"]["seq"], after["window"]["maxSeq"]);
 }
