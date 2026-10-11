@@ -34,7 +34,7 @@ fn expand(cwd: &str) -> PathBuf {
     PathBuf::from(p)
 }
 
-async fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
+pub(crate) async fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
     run("git", args, Some(cwd), GIT_TIMEOUT).await
 }
 

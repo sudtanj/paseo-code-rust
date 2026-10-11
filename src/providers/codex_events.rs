@@ -79,12 +79,50 @@ impl Codex {
                     "cachedInputTokens": pick("cachedInputTokens"),
                     "outputTokens": pick("outputTokens"),
                     "contextWindowMaxTokens": usage.get("modelContextWindow").cloned().unwrap_or(Value::Null),
+                    // `last` is the most recent model call: its prompt is the live context.
+                    "contextWindowUsedTokens": usage.get("last").and_then(|l| l.get("totalTokens").or_else(|| l.get("total_tokens"))).cloned().unwrap_or(Value::Null),
                 });
                 self.emit(ProviderEvent::Usage { agent_id, usage });
             }
+            "thread/compacted" => {
+                // Compaction normally runs as a turn and ends with turn/completed.
+                // If no turn was announced for a compaction we started, this is
+                // the only completion signal, so finish it here.
+                let finished = {
+                    let mut st = self.inner.state.lock().unwrap();
+                    let unannounced = st.active.get(&agent_id).filter(|(_, turn)| turn.is_none()).map(|(thread, _)| thread.clone());
+                    if let Some(thread) = &unannounced {
+                        st.active.remove(&agent_id);
+                        st.stray_turn_end.insert(thread.clone());
+                    }
+                    unannounced.is_some()
+                };
+                if finished {
+                    self.emit(ProviderEvent::TurnCompleted { agent_id });
+                }
+            }
             "turn/completed" => {
                 let turn = params.get("turn").cloned().unwrap_or(Value::Null);
-                self.inner.state.lock().unwrap().active.remove(&agent_id);
+                let turn_id = s(&turn, "id");
+                // Only end the turn we are tracking: a late completion of an
+                // earlier turn (e.g. a compaction already finished via
+                // thread/compacted) must not end the prompt running now.
+                let owned = {
+                    let mut st = self.inner.state.lock().unwrap();
+                    let thread = s(params, "threadId").unwrap_or_default();
+                    let stray = st.stray_turn_end.remove(&thread);
+                    let stale = match (st.active.get(&agent_id), &turn_id) {
+                        (Some((_, Some(cur))), Some(done)) => cur != done,
+                        // The compaction already ended via thread/compacted; this
+                        // is its late completion, not the prompt now waiting.
+                        (Some((_, None)), _) => stray,
+                        _ => false,
+                    };
+                    !stale && st.active.remove(&agent_id).is_some()
+                };
+                if !owned {
+                    return;
+                }
                 match s(&turn, "status").as_deref() {
                     Some("failed") => {
                         let error = turn.get("error").and_then(|e| s(e, "message")).unwrap_or_else(|| "turn failed".into());

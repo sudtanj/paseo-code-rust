@@ -3,9 +3,11 @@
 //! Upstream Paseo spawns an app-server per agent (plus throwaway ones for model
 //! listing). The app-server already multiplexes threads, each with its own
 //! `cwd`, so here a single process serves all agents: notifications are routed
-//! by `threadId`. The process starts on first use and exits after
-//! `codex_idle` with no running turns; threads are `thread/resume`d lazily
-//! after a restart.
+//! by `threadId`. With `codex_keep_warm` (the default) the manager starts it
+//! with the daemon and restarts it if it exits; otherwise it starts on first
+//! use and exits after `codex_idle` with no running turns. Threads are
+//! `thread/resume`d lazily after a restart. How many turns may run at once
+//! (`codex_max_active`) is enforced by the manager's queue.
 
 use super::{AgentSpec, EventTx, ProviderEvent};
 use crate::config::Config;
@@ -37,9 +39,14 @@ struct State {
     /// agentId -> (threadId, turnId once known)
     active: HashMap<String, (String, Option<String>)>,
     streamed_items: HashSet<String>,
+    /// Threads whose compaction finished via `thread/compacted` before any
+    /// turn was announced; their late `turn/completed` must be ignored.
+    stray_turn_end: HashSet<String>,
     open_approvals: usize,
     last_activity: Option<Instant>,
     models: Option<Value>,
+    /// Set while another CLI is active: nothing may start the app-server.
+    blocked: bool,
 }
 
 struct Inner {
@@ -72,7 +79,15 @@ fn s(v: &Value, key: &str) -> Option<String> {
 
 impl Codex {
     pub fn new(cfg: Config, events: EventTx) -> Codex {
-        Codex { inner: Arc::new(Inner { cfg, events, start_lock: tokio::sync::Mutex::new(()), state: Mutex::new(State::default()) }) }
+        // The model list survives restarts on disk, so pickers work even while
+        // Codex is not the active CLI (and its app-server is stopped).
+        let models = Self::disk_models(&cfg);
+        let state = State { models, ..State::default() };
+        Codex { inner: Arc::new(Inner { cfg, events, start_lock: tokio::sync::Mutex::new(()), state: Mutex::new(state) }) }
+    }
+
+    fn models_path(cfg: &Config) -> std::path::PathBuf {
+        cfg.home.join("codex-models.json")
     }
 
     pub fn is_running(&self) -> bool {
@@ -83,6 +98,9 @@ impl Codex {
         let _guard = self.inner.start_lock.lock().await;
         if self.is_running() {
             return Ok(());
+        }
+        if self.inner.state.lock().unwrap().blocked {
+            return Err("Codex is stopped while Claude Code is the active CLI".into());
         }
         self.spawn()?;
         let init = json!({
@@ -100,6 +118,7 @@ impl Codex {
     fn spawn(&self) -> Result<(), String> {
         let mut cmd = Command::new(&self.inner.cfg.codex_bin);
         cmd.arg("app-server").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
+        super::deprioritize(&mut cmd, &self.inner.cfg);
         let mut child = cmd.spawn().map_err(|e| format!("failed to start {}: {e}", self.inner.cfg.codex_bin))?;
         let mut stdin = child.stdin.take().ok_or("no stdin")?;
         let stdout = child.stdout.take().ok_or("no stdout")?;
@@ -149,6 +168,7 @@ impl Codex {
                 st.proc = None;
             }
             st.loaded.clear();
+            st.stray_turn_end.clear();
             st.open_approvals = 0;
             (std::mem::take(&mut st.pending), std::mem::take(&mut st.active))
         };
@@ -242,6 +262,9 @@ impl Codex {
         if let Some(m) = &model {
             params["model"] = json!(m);
         }
+        if let Some(effort) = spec.thinking.as_deref().filter(|e| !e.is_empty() && *e != "default") {
+            params["effort"] = json!(effort);
+        }
         match self.request("turn/start", params, Duration::from_secs(90)).await {
             Ok(res) => {
                 if let Some(turn_id) = res.get("turn").and_then(|t| s(t, "id")) {
@@ -258,10 +281,48 @@ impl Codex {
         }
     }
 
+    /// Summarise an agent's thread in place (`thread/compact/start`). Runs as
+    /// a turn: completion arrives as `turn/completed` (or `thread/compacted`).
+    pub async fn compact(&self, spec: AgentSpec) -> Result<(), String> {
+        self.ensure_started().await?;
+        let thread_id = spec.session_id.clone().ok_or("no Codex thread to compact yet")?;
+        let loaded = self.inner.state.lock().unwrap().loaded.contains(&thread_id);
+        if !loaded {
+            self.request("thread/resume", json!({ "threadId": thread_id }), Duration::from_secs(120)).await?;
+        }
+        {
+            let mut st = self.inner.state.lock().unwrap();
+            st.loaded.insert(thread_id.clone());
+            st.thread_agent.insert(thread_id.clone(), spec.id.clone());
+            st.active.insert(spec.id.clone(), (thread_id.clone(), None));
+        }
+        match self.request("thread/compact/start", json!({ "threadId": thread_id }), Duration::from_secs(90)).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                self.inner.state.lock().unwrap().active.remove(&spec.id);
+                Err(e)
+            }
+        }
+    }
+
     pub async fn interrupt(&self, agent_id: &str) {
         let target = self.inner.state.lock().unwrap().active.get(agent_id).cloned();
         if let Some((thread_id, Some(turn_id))) = target {
             let _ = self.request("turn/interrupt", json!({ "threadId": thread_id, "turnId": turn_id }), Duration::from_secs(5)).await;
+        }
+    }
+
+    /// Drop an agent's routing right away and interrupt its running turn in
+    /// the background. Routing is gone before any new turn can be started,
+    /// so the interrupt can never clobber a later turn's state.
+    pub fn abandon(&self, agent_id: &str) {
+        let target = self.inner.state.lock().unwrap().active.get(agent_id).cloned();
+        self.forget(agent_id);
+        if let Some((thread_id, Some(turn_id))) = target {
+            let this = self.clone();
+            tokio::spawn(async move {
+                let _ = this.request("turn/interrupt", json!({ "threadId": thread_id, "turnId": turn_id }), Duration::from_secs(5)).await;
+            });
         }
     }
 
@@ -282,23 +343,59 @@ impl Codex {
             .iter()
             .filter_map(|m| {
                 let id = s(m, "model").or_else(|| s(m, "id"))?;
-                Some(json!({
+                let default_effort = s(m, "defaultReasoningEffort");
+                let efforts: Vec<Value> = m
+                    .get("supportedReasoningEfforts")
+                    .and_then(|e| e.as_array())
+                    .map(|list| {
+                        list.iter()
+                            .filter_map(|e| {
+                                let effort = s(e, "reasoningEffort").or_else(|| e.as_str().map(String::from))?;
+                                Some(json!({
+                                    "id": effort,
+                                    "label": effort,
+                                    "description": s(e, "description"),
+                                    "isDefault": default_effort.as_deref() == Some(effort.as_str()),
+                                }))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let mut model = json!({
                     "provider": "codex",
                     "id": id,
                     "label": s(m, "displayName").unwrap_or_else(|| id.clone()),
                     "description": s(m, "description"),
                     "isDefault": m.get("isDefault").and_then(|v| v.as_bool()).unwrap_or(false),
-                }))
+                });
+                if !efforts.is_empty() {
+                    model["thinkingOptions"] = Value::Array(efforts);
+                }
+                if let Some(d) = default_effort {
+                    model["defaultThinkingOptionId"] = json!(d);
+                }
+                Some(model)
             })
             .collect();
         let models = Value::Array(models);
         self.inner.state.lock().unwrap().models = Some(models.clone());
+        if models.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+            if let Err(e) = crate::util::write_atomic(&Self::models_path(&self.inner.cfg), models.to_string().as_bytes(), false) {
+                crate::warn!("could not cache codex models: {e}");
+            }
+        }
         Ok(models)
     }
 
     /// The model list from an earlier `list_models`, without starting anything.
+    /// Falls back to the on-disk copy (e.g. after a refresh whose fetch failed).
     pub fn cached_models(&self) -> Option<Value> {
-        self.inner.state.lock().unwrap().models.clone()
+        let cached = self.inner.state.lock().unwrap().models.clone();
+        cached.or_else(|| Self::disk_models(&self.inner.cfg))
+    }
+
+    fn disk_models(cfg: &Config) -> Option<Value> {
+        std::fs::read(Self::models_path(cfg)).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).filter(|m| m.as_array().map(|a| !a.is_empty()).unwrap_or(false))
     }
 
     /// Drop the cached model list so the next `list_models` asks the app-server again.
@@ -315,8 +412,18 @@ impl Codex {
         }
     }
 
+    /// Start the shared process ahead of the first turn and cache the model
+    /// list while at it, so neither costs a cold start later.
+    pub async fn warm_up(&self) -> Result<(), String> {
+        self.ensure_started().await?;
+        self.list_models().await.map(|_| ())
+    }
+
     /// Stop the shared process when nothing has used it for `codex_idle`.
     pub fn reap(&self) {
+        if self.inner.cfg.codex_keep_warm {
+            return;
+        }
         let idle = {
             let st = self.inner.state.lock().unwrap();
             st.proc.is_some()
@@ -333,6 +440,11 @@ impl Codex {
 
     pub fn shutdown(&self) {
         self.kill();
+    }
+
+    /// Allow or forbid starting the app-server (only one CLI runs at a time).
+    pub fn set_allowed(&self, allowed: bool) {
+        self.inner.state.lock().unwrap().blocked = !allowed;
     }
 
     fn agent_for(&self, params: &Value) -> Option<String> {

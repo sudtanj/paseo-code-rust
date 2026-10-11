@@ -25,7 +25,7 @@ impl Manager {
             .max_by_key(|p| p.root_path.len())
             .map(|p| p.root_path.clone());
         found.unwrap_or_else(|| {
-            self.projects.push(ProjectRecord { root_path: dir.to_string(), created_at: now_iso() });
+            self.projects.push(ProjectRecord { root_path: dir.to_string(), created_at: now_iso(), custom_name: None, owned: false });
             self.store.save_projects(&self.projects);
             dir.to_string()
         })

@@ -24,12 +24,38 @@ pub struct Config {
     pub app_base_url: String,
     pub claude_bin: String,
     pub codex_bin: String,
-    /// How long an idle `claude` process is kept warm before it is reaped.
+    /// How long an idle `claude` process is kept warm before it is reaped
+    /// (ignored when `claude_keep_warm` is on).
     pub claude_idle: Duration,
     /// Hard cap on simultaneously live `claude` processes across all projects.
+    /// Prompts beyond the cap wait in a FIFO queue.
     pub claude_max_live: usize,
-    /// How long the shared `codex app-server` stays up with no active turns.
+    /// Never reap the idle `claude` process, and pre-start one for the most
+    /// recently used Claude agent so the next prompt skips the cold start.
+    pub claude_keep_warm: bool,
+    /// How long the shared `codex app-server` stays up with no active turns
+    /// (ignored when `codex_keep_warm` is on).
     pub codex_idle: Duration,
+    /// Max Codex turns running at once across all projects; the rest queue.
+    pub codex_max_active: usize,
+    /// Start the shared `codex app-server` with the daemon and keep it up,
+    /// restarting it if it exits.
+    pub codex_keep_warm: bool,
+    /// Niceness for `claude` / `codex` processes (and everything they run),
+    /// so heavy agent work yields the CPU to the daemon. 0 = unchanged.
+    pub agent_nice: i32,
+    /// `oom_score_adj` for agent processes: under memory pressure the kernel
+    /// kills an agent before it touches the daemon. 0 = unchanged.
+    pub agent_oom_score_adj: i32,
+    /// Lowest best-effort I/O priority for agent processes.
+    pub agent_low_io: bool,
+    /// Compact an agent's context after a turn once it fills this share of
+    /// the context window (percent). 0 disables daemon-triggered compaction.
+    pub auto_compact_pct: u32,
+    /// Context window assumed for Claude models (1M for `[1m]` models).
+    pub claude_context_window: u64,
+    /// What happens to a project's directory when the project is removed.
+    pub delete_project_files: crate::cleanup::Policy,
     /// Timelines of agents untouched for this long are dropped from memory.
     pub timeline_unload: Duration,
     /// Instructions added to every agent; `PASEO_DEFAULT_SYSTEM_PROMPT` overrides
@@ -90,8 +116,17 @@ impl Config {
             claude_bin: env("PASEO_CLAUDE_BIN").unwrap_or_else(|| "claude".into()),
             codex_bin: env("PASEO_CODEX_BIN").unwrap_or_else(|| "codex".into()),
             claude_idle: env_secs("PASEO_CLAUDE_IDLE_SECS", 90),
-            claude_max_live: env("PASEO_CLAUDE_MAX_LIVE").and_then(|v| v.parse().ok()).unwrap_or(3).max(1),
+            claude_max_live: env("PASEO_CLAUDE_MAX_LIVE").and_then(|v| v.parse().ok()).unwrap_or(1).max(1),
+            claude_keep_warm: env_bool("PASEO_CLAUDE_KEEP_WARM").unwrap_or(true),
             codex_idle: env_secs("PASEO_CODEX_IDLE_SECS", 300),
+            codex_max_active: env("PASEO_CODEX_MAX_ACTIVE").and_then(|v| v.parse().ok()).unwrap_or(1).max(1),
+            codex_keep_warm: env_bool("PASEO_CODEX_KEEP_WARM").unwrap_or(true),
+            agent_nice: env("PASEO_AGENT_NICE").and_then(|v| v.parse().ok()).unwrap_or(10).clamp(0, 19),
+            agent_oom_score_adj: env("PASEO_AGENT_OOM_SCORE_ADJ").and_then(|v| v.parse().ok()).unwrap_or(500).clamp(0, 1000),
+            agent_low_io: env_bool("PASEO_AGENT_LOW_IO").unwrap_or(true),
+            auto_compact_pct: env("PASEO_AUTO_COMPACT_PCT").and_then(|v| v.parse().ok()).unwrap_or(70).min(99),
+            claude_context_window: env("PASEO_CLAUDE_CONTEXT_WINDOW").and_then(|v| v.parse().ok()).unwrap_or(200_000),
+            delete_project_files: crate::cleanup::Policy::parse(env("PASEO_DELETE_PROJECT_FILES").as_deref()),
             timeline_unload: env_secs("PASEO_TIMELINE_UNLOAD_SECS", 600),
             default_system_prompt: match std::env::var("PASEO_DEFAULT_SYSTEM_PROMPT") {
                 Ok(v) if v.trim().is_empty() => None,
