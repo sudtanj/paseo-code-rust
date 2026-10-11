@@ -518,6 +518,8 @@ impl Manager {
             attention_reason: None,
             attention_at: None,
             thinking_option_id: s(&config, "thinkingOptionId").filter(|t| !t.is_empty() && t != "default"),
+            pending_turn: None,
+            pending_queue: Vec::new(),
         };
         let id = rec.id.clone();
         let mut agent = Agent::new(rec);

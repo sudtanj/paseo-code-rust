@@ -38,8 +38,8 @@ fn unique_dir(tag: &str) -> PathBuf {
 
 /// A stand-in for `claude -p --input-format stream-json`: answers every user
 /// message with one assistant message and a successful result.
-fn fake_claude(dir: &std::path::Path) -> PathBuf {
-    let path = dir.join("fake-claude.sh");
+fn fake_claude(dir: &std::path::Path, hang: bool) -> PathBuf {
+    let path = dir.join(if hang { "fake-claude-hang.sh" } else { "fake-claude.sh" });
     let script = r#"#!/bin/sh
 while IFS= read -r line; do
   case "$line" in
@@ -50,7 +50,8 @@ while IFS= read -r line; do
   esac
 done
 "#;
-    std::fs::write(&path, script).unwrap();
+    let hanging = "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"type\":\"user\"'*) sleep 600 ;;\n  esac\ndone\n";
+    std::fs::write(&path, if hang { hanging } else { script }).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -60,9 +61,14 @@ done
 }
 
 fn start(tag: &str, password: Option<&str>) -> Daemon {
-    let dir = unique_dir(tag);
+    start_at(unique_dir(tag), password, false)
+}
+
+/// Start (or restart) the daemon on an existing directory. `hang`: the fake
+/// claude accepts a prompt and never answers, to simulate a turn in flight.
+fn start_at(dir: PathBuf, password: Option<&str>, hang: bool) -> Daemon {
     let port = free_port();
-    let claude = fake_claude(&dir);
+    let claude = fake_claude(&dir, hang);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_paseo-lite"));
     cmd.args(["--listen", &format!("127.0.0.1:{port}"), "--no-relay"])
         .env("PASEO_LITE_HOME", dir.join("home"))
@@ -350,4 +356,59 @@ async fn git_actions_commit_branch_stash_history() {
     let r = rpc(&mut ws, json!({ "type": "checkout_pr_status_request", "requestId": "g15", "cwd": cwd }), "checkout_pr_status_response").await;
     assert_eq!(r["authState"], "no_remote", "{r}");
     assert!(r["status"].is_null());
+}
+
+/// A turn in flight when the daemon is killed (container replaced) resumes by
+/// itself after the restart, in the same conversation.
+#[tokio::test]
+async fn interrupted_turn_resumes_after_hard_kill() {
+    let dir = unique_dir("resume");
+    let cwd = dir.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    // First life: the "model" takes the prompt and never answers.
+    let mut first = start_at(dir.clone(), None, true);
+    let mut ws = connect(first.port).await;
+    hello(&mut ws, None).await;
+    send(
+        &mut ws,
+        session(json!({ "type": "create_agent_request", "requestId": "r1", "config": { "provider": "claude", "cwd": cwd.to_string_lossy(), "modeId": "bypassPermissions" }, "initialPrompt": "do the thing" })),
+    )
+    .await;
+    let agent_id = recv_until(&mut ws, |v| {
+        let p = &v["message"]["payload"];
+        (v["message"]["type"] == "status" && p["status"] == "agent_created").then(|| p["agentId"].as_str().unwrap().to_string())
+    })
+    .await;
+    // Wait until the agent record with its running turn is on disk, then SIGKILL (no graceful flush).
+    let agents_file = dir.join("home").join("agents.json");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let saved = std::fs::read_to_string(&agents_file).unwrap_or_default();
+        if saved.contains("\"pendingTurn\":\"do the thing\"") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "pending turn never saved: {saved}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    first.child.kill().unwrap();
+    let _ = first.child.wait();
+    std::mem::forget(first); // keep the directory: it is the "volume"
+
+    // Second life: a working model. The daemon resumes the turn on its own.
+    let second = start_at(dir, None, false);
+    let mut ws = connect(second.port).await;
+    hello(&mut ws, None).await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let tl = loop {
+        let tl = rpc(&mut ws, json!({ "type": "fetch_agent_timeline_request", "requestId": "r2", "agentId": agent_id, "direction": "tail", "limit": 50 }), "fetch_agent_timeline_response").await;
+        let has_answer = tl["entries"].as_array().unwrap().iter().any(|e| e["item"]["type"] == "assistant_message");
+        if has_answer {
+            break tl;
+        }
+        assert!(Instant::now() < deadline, "turn was not resumed: {tl}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    };
+    let texts: Vec<String> = tl["entries"].as_array().unwrap().iter().filter(|e| e["item"]["type"] == "notification").map(|e| e["item"]["message"].as_str().unwrap().to_string()).collect();
+    assert!(texts.iter().any(|t| t.contains("restarted")), "{texts:?}");
 }

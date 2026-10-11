@@ -169,6 +169,8 @@ impl Manager {
                     attention_reason: None,
                     attention_at: None,
                     thinking_option_id: non_default(s(&overrides, "thinkingOptionId")),
+                    pending_turn: None,
+                    pending_queue: Vec::new(),
                 };
                 let id = rec.id.clone();
                 let mut agent = Agent::new(rec);

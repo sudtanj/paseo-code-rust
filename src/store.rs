@@ -55,6 +55,13 @@ pub struct AgentRecord {
     /// Reasoning effort (`low` … `max`); None = provider default.
     #[serde(default)]
     pub thinking_option_id: Option<String>,
+    /// The prompt of a turn that was running or waiting when the daemon last
+    /// saved. Survives a restart so the turn can be resumed automatically.
+    #[serde(default)]
+    pub pending_turn: Option<String>,
+    /// Follow-up prompts queued behind the running turn.
+    #[serde(default)]
+    pub pending_queue: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

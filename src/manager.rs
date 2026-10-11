@@ -192,6 +192,7 @@ impl Manager {
     }
 
     pub async fn run(mut self, mut cmds: mpsc::UnboundedReceiver<Cmd>, mut events: mpsc::UnboundedReceiver<ProviderEvent>, mut shutdown: oneshot::Receiver<()>) {
+        self.resume_interrupted();
         let mut tick = tokio::time::interval(Duration::from_secs(2));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -434,6 +435,7 @@ impl Manager {
         }
         if agent.status == "running" {
             agent.queue.push_back(text);
+            self.persist_pending(agent_id);
             return Ok(());
         }
         self.start_turn(agent_id, text, message_id);
@@ -468,6 +470,7 @@ impl Manager {
         self.stream(agent_id, &provider, json!({ "type": "turn_started", "provider": provider, "turnId": turn_id }));
         self.touch(agent_id);
         self.publish_agent(agent_id);
+        self.persist_pending(agent_id);
         self.dispatch(agent_id, text);
     }
 
@@ -647,6 +650,7 @@ impl Manager {
             }
             (provider, turn_id)
         };
+        self.persist_pending(agent_id);
         let event = match &outcome {
             Ok(None) => {
                 let mut ev = json!({ "type": "turn_completed", "provider": provider, "turnId": turn_id });
@@ -696,6 +700,66 @@ impl Manager {
         let next = self.agents.get_mut(agent_id).and_then(|a| a.queue.pop_front());
         if let Some(text) = next {
             self.start_turn(agent_id, text, None);
+        }
+    }
+
+    fn save_agents_now(&mut self) {
+        self.agents_dirty = false;
+        self.store.save_agents(self.agents.values().map(|a| &a.rec));
+    }
+
+    /// Record the running turn and queued follow-ups in the agent record and
+    /// save at once, so a hard kill (container replaced, OOM) can't lose them.
+    fn persist_pending(&mut self, agent_id: &str) {
+        let Some(a) = self.agents.get_mut(agent_id) else { return };
+        let pending = (a.status == "running" && !a.compacting && !a.turn_text.is_empty()).then(|| a.turn_text.clone());
+        let queue: Vec<String> = a.queue.iter().cloned().collect();
+        if a.rec.pending_turn == pending && a.rec.pending_queue == queue {
+            return;
+        }
+        a.rec.pending_turn = pending;
+        a.rec.pending_queue = queue;
+        self.save_agents_now();
+    }
+
+    /// After a restart: continue every turn that was interrupted and restore
+    /// the queued follow-ups, so the agent carries on without anyone noticing.
+    fn resume_interrupted(&mut self) {
+        let ids: Vec<String> = self.agents.values().filter(|a| a.rec.archived_at.is_none() && (a.rec.pending_turn.is_some() || !a.rec.pending_queue.is_empty())).map(|a| a.rec.id.clone()).collect();
+        for id in ids {
+            let store = &self.store;
+            let Some(a) = self.agents.get_mut(&id) else { continue };
+            a.ensure_timeline(store);
+            a.queue = std::mem::take(&mut a.rec.pending_queue).into();
+            let Some(prompt) = a.rec.pending_turn.take() else {
+                // Only follow-ups were waiting: start the next one.
+                if let Some(next) = a.queue.pop_front() {
+                    self.start_turn(&id, next, None);
+                }
+                continue;
+            };
+            // Did the turn get anywhere before the restart? Rows after the last user message.
+            let rows = a.timeline.as_deref().unwrap_or_default();
+            let after_user = rows.iter().rposition(|r| r.item.get("type").and_then(|t| t.as_str()) == Some("user_message")).map(|i| &rows[i + 1..]).unwrap_or_default();
+            let produced = after_user.iter().any(|r| matches!(r.item.get("type").and_then(|t| t.as_str()), Some("assistant_message" | "reasoning" | "tool_call")));
+            a.status = "running";
+            a.active_turn = Some((new_id(), now_iso()));
+            a.turn_text = prompt.clone();
+            a.attempts = 0;
+            a.produced = produced;
+            a.compacting = false;
+            a.retry_at = None;
+            a.last_event = Instant::now();
+            let provider = a.rec.provider.clone();
+            let turn_id = a.active_turn.as_ref().map(|t| t.0.clone());
+            crate::log!("resuming interrupted turn for agent {id}");
+            let note = json!({ "type": "notification", "level": "info", "message": "paseo-lite restarted while this agent was working. Resuming where it left off." });
+            self.append_item(&id, note);
+            self.stream(&id, &provider, json!({ "type": "turn_started", "provider": provider, "turnId": turn_id }));
+            self.publish_agent(&id);
+            self.persist_pending(&id);
+            // With progress already made, ask the model to pick up; otherwise resend the prompt.
+            self.dispatch(&id, if produced { RESUME_PROMPT.to_string() } else { prompt });
         }
     }
 
@@ -786,6 +850,8 @@ impl Manager {
     pub fn cancel(&mut self, agent_id: &str) {
         let Some(agent) = self.agents.get_mut(agent_id) else { return };
         agent.queue.clear();
+        self.persist_pending(agent_id);
+        let Some(agent) = self.agents.get_mut(agent_id) else { return };
         if agent.status != "running" {
             return;
         }
@@ -815,6 +881,8 @@ impl Manager {
                     a.rec.session_id = Some(session_id.clone());
                     let provider = a.rec.provider.clone();
                     self.agents_dirty = true;
+                    // Losing the session id on a hard kill would orphan the conversation.
+                    self.save_agents_now();
                     self.stream(&agent_id, &provider, json!({ "type": "thread_started", "provider": provider, "sessionId": session_id }));
                 }
             }
@@ -972,6 +1040,7 @@ impl Manager {
             a.compacting = false;
             a.retry_at = None;
         }
+        self.persist_pending(agent_id);
         self.claude.stop(agent_id);
         self.cli_queue.retain(|(id, _)| id != agent_id);
         // Interrupt the turn in the shared app-server too, so the freed slot
@@ -1012,6 +1081,9 @@ impl Agent {
 
 /// Sent when an interrupted turn is retried after it had already produced output.
 const CONTINUE_PROMPT: &str = "Your previous response was interrupted unexpectedly. Continue from where you left off and finish the task.";
+
+/// Sent when the daemon restarted in the middle of a turn that had already produced output.
+const RESUME_PROMPT: &str = "The server was restarted while you were working, which interrupted your previous response. Continue from where you left off and finish the task.";
 
 /// Transient failures are retried; auth, quota and setup problems won't fix
 /// themselves, so those surface immediately.
