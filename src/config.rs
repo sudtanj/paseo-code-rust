@@ -54,6 +54,13 @@ pub struct Config {
     pub auto_compact_pct: u32,
     /// Context window assumed for Claude models (1M for `[1m]` models).
     pub claude_context_window: u64,
+    /// Automatic retries of a failed, empty or stalled turn (0 = off).
+    pub retry_max: u32,
+    /// First retry delay; doubles each attempt (capped at 60s).
+    pub retry_base: Duration,
+    /// A running turn with no output for this long is treated as stuck and
+    /// retried (0 = off). Long-running tool calls are exempt.
+    pub stall_timeout: Duration,
     /// What happens to a project's directory when the project is removed.
     pub delete_project_files: crate::cleanup::Policy,
     /// Timelines of agents untouched for this long are dropped from memory.
@@ -126,6 +133,9 @@ impl Config {
             agent_low_io: env_bool("PASEO_AGENT_LOW_IO").unwrap_or(true),
             auto_compact_pct: env("PASEO_AUTO_COMPACT_PCT").and_then(|v| v.parse().ok()).unwrap_or(70).min(99),
             claude_context_window: env("PASEO_CLAUDE_CONTEXT_WINDOW").and_then(|v| v.parse().ok()).unwrap_or(200_000),
+            retry_max: env("PASEO_RETRY_MAX").and_then(|v| v.parse().ok()).unwrap_or(3),
+            retry_base: env_secs("PASEO_RETRY_BASE_SECS", 5),
+            stall_timeout: env_secs("PASEO_STALL_SECS", 600),
             delete_project_files: crate::cleanup::Policy::parse(env("PASEO_DELETE_PROJECT_FILES").as_deref()),
             timeline_unload: env_secs("PASEO_TIMELINE_UNLOAD_SECS", 600),
             default_system_prompt: match std::env::var("PASEO_DEFAULT_SYSTEM_PROMPT") {

@@ -69,6 +69,17 @@ pub struct Agent {
     pub last_touch: Instant,
     /// The active turn is a daemon-started compaction, not a user prompt.
     pub compacting: bool,
+    /// The user prompt of the running turn (resent when a retry has nothing to continue).
+    pub turn_text: String,
+    /// Automatic retries used by the running turn.
+    pub attempts: u32,
+    /// The turn produced output (assistant text, reasoning or a tool call).
+    pub produced: bool,
+    /// Last sign of life from the provider, for the stall watchdog.
+    pub last_event: Instant,
+    /// A retry is scheduled: when to re-dispatch and with which prompt.
+    pub retry_at: Option<Instant>,
+    pub retry_text: String,
 }
 
 pub struct Manager {
@@ -212,6 +223,7 @@ impl Manager {
         self.claude.reap();
         self.codex.reap();
         self.keep_warm();
+        self.run_retries_and_watchdog();
         self.flush_all();
         let unload = self.cfg.timeline_unload;
         for agent in self.agents.values_mut() {
@@ -433,6 +445,11 @@ impl Manager {
         let provider = {
             let Some(agent) = self.agents.get_mut(agent_id) else { return };
             agent.status = "running";
+            agent.turn_text = text.clone();
+            agent.attempts = 0;
+            agent.produced = false;
+            agent.retry_at = None;
+            agent.last_event = Instant::now();
             agent.active_turn = Some((turn_id.clone(), now_iso()));
             agent.rec.last_user_message_at = Some(now_iso());
             agent.rec.last_error = None;
@@ -563,6 +580,8 @@ impl Manager {
             agent.status = "running";
             agent.active_turn = Some((turn_id, now_iso()));
             agent.compacting = true;
+            agent.last_event = Instant::now();
+            agent.retry_at = None;
             // Wait for fresh numbers before considering another compaction.
             if let Some(Value::Object(u)) = agent.rec.last_usage.as_mut() {
                 u.remove("contextWindowUsedTokens");
@@ -582,7 +601,8 @@ impl Manager {
     /// End the active turn. `Ok(None)` completed, `Ok(Some(reason))` canceled, `Err` failed.
     pub fn finish_turn(&mut self, agent_id: &str, outcome: Result<Option<String>, String>) {
         let compacting = match self.agents.get_mut(agent_id) {
-            Some(a) if a.status == "running" => std::mem::take(&mut a.compacting),
+            // A scheduled retry owns the turn; late events from the dead attempt are ignored.
+            Some(a) if a.status == "running" && a.retry_at.is_none() => std::mem::take(&mut a.compacting),
             _ => return,
         };
         // A failed auto-compaction is not the user's failure: note it and
@@ -595,6 +615,13 @@ impl Manager {
             }
             other => other,
         };
+        if !compacting {
+            if let Some(reason) = self.retry_reason(agent_id, &outcome) {
+                if self.schedule_retry(agent_id, &reason) {
+                    return;
+                }
+            }
+        }
         let (provider, turn_id) = {
             let Some(agent) = self.agents.get_mut(agent_id) else { return };
             let turn_id = agent.active_turn.take().map(|t| t.0);
@@ -672,10 +699,99 @@ impl Manager {
         }
     }
 
+    /// Why a finished turn should be retried automatically, if it should:
+    /// a transient error, no output at all, or a stop in the middle of a
+    /// tool call. Auth/quota errors and user cancels are never retried.
+    fn retry_reason(&self, agent_id: &str, outcome: &Result<Option<String>, String>) -> Option<String> {
+        if self.cfg.retry_max == 0 {
+            return None;
+        }
+        let a = self.agents.get(agent_id)?;
+        match outcome {
+            Err(e) => retryable_error(e).then(|| e.clone()),
+            Ok(None) if !a.produced => Some("the model returned no response".into()),
+            Ok(None) => {
+                let last = a.timeline.as_ref().and_then(|t| t.last())?;
+                let kind = last.item.get("type").and_then(|t| t.as_str());
+                let status = last.item.get("status").and_then(|t| t.as_str());
+                (kind == Some("tool_call") && matches!(status, Some("canceled") | Some("running"))).then(|| "the model stopped in the middle of a tool call".into())
+            }
+            Ok(Some(_)) => None,
+        }
+    }
+
+    /// Stop the failed attempt and re-dispatch after a backoff. False when the
+    /// retries are used up (the failure is then reported as usual).
+    fn schedule_retry(&mut self, agent_id: &str, reason: &str) -> bool {
+        let (max, base) = (self.cfg.retry_max, self.cfg.retry_base);
+        let Some(a) = self.agents.get_mut(agent_id) else { return false };
+        if a.attempts >= max {
+            return false;
+        }
+        a.attempts += 1;
+        let attempt = a.attempts;
+        let delay = (base * 2u32.saturating_pow(attempt - 1)).min(Duration::from_secs(60));
+        a.retry_at = Some(Instant::now() + delay);
+        // Output already streamed stays in the conversation: ask the model to
+        // pick up from there. With nothing produced, resend the prompt.
+        a.retry_text = if a.produced { CONTINUE_PROMPT.to_string() } else { a.turn_text.clone() };
+        // Dropping the reply senders makes providers deny outstanding requests.
+        a.permissions.clear();
+        let provider = a.rec.provider.clone();
+        crate::warn!("agent {agent_id}: {reason}; retry {attempt}/{max} in {}s", delay.as_secs());
+        // A clean slate: a fresh CLI process resumes the session; Codex's turn is interrupted.
+        self.running.remove(agent_id);
+        self.cli_queue.retain(|(id, _)| id != agent_id);
+        if provider == "codex" {
+            self.codex.abandon(agent_id);
+        } else {
+            self.claude.stop(agent_id);
+        }
+        let note = json!({ "type": "notification", "level": "warning", "message": format!("Something went wrong ({}). Retrying automatically in {}s (attempt {attempt} of {max})", crate::util::truncate(reason, 160), delay.as_secs()) });
+        self.append_item(agent_id, note);
+        self.publish_agent(agent_id);
+        self.pump();
+        true
+    }
+
+    /// Housekeeping: re-dispatch due retries and unstick silent turns.
+    fn run_retries_and_watchdog(&mut self) {
+        let now = Instant::now();
+        let due: Vec<(String, String)> = self.agents.values().filter(|a| a.retry_at.map(|t| now >= t).unwrap_or(false)).map(|a| (a.rec.id.clone(), a.retry_text.clone())).collect();
+        for (id, text) in due {
+            if let Some(a) = self.agents.get_mut(&id) {
+                a.retry_at = None;
+                a.last_event = Instant::now();
+            }
+            self.dispatch(&id, text);
+        }
+        let limit = self.cfg.stall_timeout;
+        if limit.is_zero() || self.cfg.retry_max == 0 {
+            return;
+        }
+        let stalled: Vec<String> = self
+            .agents
+            .values()
+            .filter(|a| a.status == "running" && a.retry_at.is_none() && self.running.contains(&a.rec.id) && a.permissions.is_empty() && a.last_event.elapsed() >= limit)
+            // A long-running tool call is quiet by nature.
+            .filter(|a| !a.timeline.as_ref().and_then(|t| t.last()).map(|r| r.item.get("type").and_then(|t| t.as_str()) == Some("tool_call") && r.item.get("status").and_then(|s| s.as_str()) == Some("running")).unwrap_or(false))
+            .map(|a| a.rec.id.clone())
+            .collect();
+        for id in stalled {
+            crate::warn!("agent {id}: no output for {}s; treating the turn as stuck", limit.as_secs());
+            self.finish_turn(&id, Err(format!("no output for {} minutes", (limit.as_secs() / 60).max(1))));
+        }
+    }
+
     pub fn cancel(&mut self, agent_id: &str) {
         let Some(agent) = self.agents.get_mut(agent_id) else { return };
         agent.queue.clear();
         if agent.status != "running" {
+            return;
+        }
+        if agent.retry_at.take().is_some() {
+            // Canceling while a retry is pending: the turn is simply over.
+            self.finish_turn(agent_id, Ok(Some("canceled".into())));
             return;
         }
         let is_codex = agent.rec.provider == "codex";
@@ -704,7 +820,11 @@ impl Manager {
             }
             ProviderEvent::TurnStarted { .. } => {}
             ProviderEvent::Timeline { agent_id, item } => {
-                if self.agents.get(&agent_id).map(|a| a.status == "running").unwrap_or(false) {
+                if let Some(a) = self.agents.get_mut(&agent_id).filter(|a| a.status == "running" && a.retry_at.is_none()) {
+                    a.last_event = Instant::now();
+                    if matches!(item.get("type").and_then(|t| t.as_str()), Some("assistant_message" | "reasoning" | "tool_call")) {
+                        a.produced = true;
+                    }
                     self.append_item(&agent_id, item);
                 }
             }
@@ -850,6 +970,7 @@ impl Manager {
             a.status = "idle";
             a.active_turn = None;
             a.compacting = false;
+            a.retry_at = None;
         }
         self.claude.stop(agent_id);
         self.cli_queue.retain(|(id, _)| id != agent_id);
@@ -864,7 +985,7 @@ impl Manager {
 
 impl Agent {
     pub fn new(rec: AgentRecord) -> Agent {
-        Agent { rec, status: "idle", active_turn: None, queue: VecDeque::new(), permissions: Vec::new(), timeline: None, dirty_rows: BTreeSet::new(), last_touch: Instant::now(), compacting: false }
+        Agent { rec, status: "idle", active_turn: None, queue: VecDeque::new(), permissions: Vec::new(), timeline: None, dirty_rows: BTreeSet::new(), last_touch: Instant::now(), compacting: false, turn_text: String::new(), attempts: 0, produced: false, last_event: Instant::now(), retry_at: None, retry_text: String::new() }
     }
 
     pub fn ensure_timeline(&mut self, store: &Store) {
@@ -887,4 +1008,17 @@ impl Agent {
         let out: Vec<&Row> = rows.iter().filter(|r| dirty.contains(&r.seq_start)).collect();
         store.append_rows(&self.rec.id, &out);
     }
+}
+
+/// Sent when an interrupted turn is retried after it had already produced output.
+const CONTINUE_PROMPT: &str = "Your previous response was interrupted unexpectedly. Continue from where you left off and finish the task.";
+
+/// Transient failures are retried; auth, quota and setup problems won't fix
+/// themselves, so those surface immediately.
+fn retryable_error(error: &str) -> bool {
+    const PERMANENT: [&str; 12] = [
+        "not logged in", "log in", "login", "authentication", "unauthorized", "invalid api key", "credit balance", "usage limit", "quota", "failed to start", "no such file", "not found",
+    ];
+    let e = error.to_ascii_lowercase();
+    !PERMANENT.iter().any(|p| e.contains(p))
 }
