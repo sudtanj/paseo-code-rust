@@ -351,6 +351,38 @@ impl Ledger {
         total
     }
 
+    /// For estimating and trimming cost: the 30-day daily average and monthly
+    /// projection, the prompt-cache hit rate, then each day of the last 30
+    /// that had spend, newest first.
+    fn trend(&self, provider: &str, month: &Counters) -> Vec<Value> {
+        let daily: Vec<(String, Counters)> = (0..30)
+            .map(day)
+            .filter_map(|d| {
+                let models = self.data.days.get(&d)?.get(provider)?;
+                let mut c = Counters::default();
+                models.values().for_each(|m| c.add(m));
+                (!c.is_zero()).then_some((d, c))
+            })
+            .collect();
+        let Some((oldest, _)) = daily.last() else { return Vec::new() };
+        // Average over the days since tracking began, not a full 30 if newer.
+        let span = (0..30).position(|k| day(k) == *oldest).map(|k| k as u64 + 1).unwrap_or(30);
+        let avg_cost = month.cost / span as f64;
+        let avg_tokens = month.tokens() / span;
+        let prompt = month.input + month.cached + month.cache_write;
+        let mut out = vec![
+            json!({ "id": "avg-day", "label": format!("Daily average ({span}d)"), "value": format!("{} · {} tok", usd(avg_cost), short(avg_tokens)) }),
+            json!({ "id": "projected-month", "label": "Projected per 30 days", "value": usd(avg_cost * 30.0) }),
+        ];
+        if prompt > 0 {
+            out.push(json!({ "id": "cache-hit", "label": "Prompt cache hit rate (30d)", "value": format!("{:.0}%", month.cached as f64 * 100.0 / prompt as f64) }));
+        }
+        for (d, c) in daily {
+            out.push(json!({ "id": format!("day-{d}"), "label": d, "value": format!("{} tok · {}", short(c.tokens()), usd(c.cost)) }));
+        }
+        out
+    }
+
     /// One `UsageReportEntry` for `provider`; for an agent, its own spend first.
     pub fn report(&self, provider: &str, label: &str, agent_id: Option<&str>) -> Value {
         let money = |id: &str, label: &str, usd: f64| json!({ "id": id, "label": label, "used": round_usd(usd), "unit": "usd" });
@@ -377,6 +409,7 @@ impl Ledger {
         for (model, c) in models.into_iter().take(8) {
             details.push(json!({ "id": format!("model-{model}"), "label": model, "value": format!("{} tok · {}", short(c.tokens()), usd(c.cost)) }));
         }
+        details.extend(self.trend(provider, &month));
         let mut entry = json!({
             "id": provider,
             "sourceId": provider,
@@ -483,6 +516,12 @@ mod tests {
         assert_eq!(report["report"]["balances"][0]["id"], "agent-cost");
         assert!(report["report"]["details"].as_array().unwrap().iter().any(|d| d["label"] == "gpt-test"));
         assert!(report["icon"].as_str().unwrap().starts_with("<svg"));
+        let details = report["report"]["details"].as_array().unwrap();
+        let find = |id: &str| details.iter().find(|d| d["id"] == id).map(|d| d["value"].as_str().unwrap().to_string());
+        // One day tracked: the projection is that day times 30.
+        assert_eq!(find("projected-month").unwrap(), usd(d.cost * 30.0));
+        assert_eq!(find("cache-hit").unwrap(), "40%");
+        assert!(find(format!("day-{}", day(0)).as_str()).is_some());
         let _ = std::fs::remove_dir_all(dir);
     }
 
