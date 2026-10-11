@@ -62,7 +62,8 @@ pub struct Agent {
     pub rec: AgentRecord,
     pub status: &'static str,
     pub active_turn: Option<(String, String)>,
-    pub queue: VecDeque<String>,
+    /// Messages sent while a turn runs: (text, client message id).
+    pub queue: VecDeque<(String, Option<String>)>,
     pub permissions: Vec<Permission>,
     pub timeline: Option<Vec<Row>>,
     pub dirty_rows: BTreeSet<u64>,
@@ -434,15 +435,19 @@ impl Manager {
             agent.rec.archived_at = None;
         }
         if agent.status == "running" {
-            agent.queue.push_back(text);
+            agent.queue.push_back((text, message_id));
             self.persist_pending(agent_id);
             return Ok(());
         }
-        self.start_turn(agent_id, text, message_id);
+        self.start_turn(agent_id, vec![(text, message_id)]);
         Ok(())
     }
 
-    fn start_turn(&mut self, agent_id: &str, text: String, message_id: Option<String>) {
+    /// Start a turn for one or more user messages. Several messages (queued
+    /// while the previous turn ran) each get their own bubble in the chat and
+    /// are sent to the model together as one prompt.
+    fn start_turn(&mut self, agent_id: &str, messages: Vec<(String, Option<String>)>) {
+        let text = merged_prompt(&messages);
         let turn_id = new_id();
         let provider = {
             let Some(agent) = self.agents.get_mut(agent_id) else { return };
@@ -457,16 +462,20 @@ impl Manager {
             agent.rec.last_error = None;
             agent.rec.attention_reason = None;
             if agent.rec.title.is_none() {
-                let first_line = text.lines().next().unwrap_or("").trim();
+                let first = messages.first().map(|m| m.0.as_str()).unwrap_or("");
+                let first_line = first.lines().next().unwrap_or("").trim();
                 agent.rec.title = Some(crate::util::truncate(first_line, 80));
             }
             agent.rec.provider.clone()
         };
-        let mut user = json!({ "type": "user_message", "text": text, "messageId": message_id.clone().unwrap_or_else(new_id) });
-        if let Some(id) = message_id {
-            user["clientMessageId"] = json!(id);
+        // One bubble per message, exactly as the user sent them.
+        for (msg_text, message_id) in &messages {
+            let mut user = json!({ "type": "user_message", "text": msg_text, "messageId": message_id.clone().unwrap_or_else(new_id) });
+            if let Some(id) = message_id {
+                user["clientMessageId"] = json!(id);
+            }
+            self.append_item(agent_id, user);
         }
-        self.append_item(agent_id, user);
         self.stream(agent_id, &provider, json!({ "type": "turn_started", "provider": provider, "turnId": turn_id }));
         self.touch(agent_id);
         self.publish_agent(agent_id);
@@ -697,9 +706,11 @@ impl Manager {
             self.start_compaction(agent_id);
             return;
         }
-        let next = self.agents.get_mut(agent_id).and_then(|a| a.queue.pop_front());
-        if let Some(text) = next {
-            self.start_turn(agent_id, text, None);
+        // Everything the user queued for this chat runs as one turn: same
+        // conversation, one round trip, context sent once.
+        let batch = self.agents.get_mut(agent_id).map(|a| take_batch(&mut a.queue)).unwrap_or_default();
+        if !batch.is_empty() {
+            self.start_turn(agent_id, batch);
         }
     }
 
@@ -713,7 +724,7 @@ impl Manager {
     fn persist_pending(&mut self, agent_id: &str) {
         let Some(a) = self.agents.get_mut(agent_id) else { return };
         let pending = (a.status == "running" && !a.compacting && !a.turn_text.is_empty()).then(|| a.turn_text.clone());
-        let queue: Vec<String> = a.queue.iter().cloned().collect();
+        let queue: Vec<String> = a.queue.iter().map(|(t, _)| t.clone()).collect();
         if a.rec.pending_turn == pending && a.rec.pending_queue == queue {
             return;
         }
@@ -730,11 +741,12 @@ impl Manager {
             let store = &self.store;
             let Some(a) = self.agents.get_mut(&id) else { continue };
             a.ensure_timeline(store);
-            a.queue = std::mem::take(&mut a.rec.pending_queue).into();
+            a.queue = std::mem::take(&mut a.rec.pending_queue).into_iter().map(|t| (t, None)).collect();
             let Some(prompt) = a.rec.pending_turn.take() else {
                 // Only follow-ups were waiting: start the next one.
-                if let Some(next) = a.queue.pop_front() {
-                    self.start_turn(&id, next, None);
+                let batch = take_batch(&mut a.queue);
+                if !batch.is_empty() {
+                    self.start_turn(&id, batch);
                 }
                 continue;
             };
@@ -1120,5 +1132,69 @@ mod tests {
         assert_eq!(cli_of("codex"), "codex");
         assert_eq!(cli_of("claude"), "claude");
         assert_eq!(cli_label("codex"), "Codex");
+    }
+}
+
+/// The next run of queued messages to send as one turn. Slash commands
+/// (`/compact`, `/init`, ...) only work as a whole message, so a command is
+/// always a turn of its own and ends a batch.
+fn take_batch(queue: &mut VecDeque<(String, Option<String>)>) -> Vec<(String, Option<String>)> {
+    let is_command = |m: &(String, Option<String>)| m.0.trim_start().starts_with('/');
+    match queue.front() {
+        None => Vec::new(),
+        Some(m) if is_command(m) => queue.pop_front().into_iter().collect(),
+        Some(_) => {
+            let mut batch = Vec::new();
+            while queue.front().map(|m| !is_command(m)).unwrap_or(false) {
+                batch.extend(queue.pop_front());
+            }
+            batch
+        }
+    }
+}
+
+/// One prompt for a batch of messages from the same chat.
+fn merged_prompt(messages: &[(String, Option<String>)]) -> String {
+    match messages {
+        [] => String::new(),
+        [(only, _)] => only.clone(),
+        many => {
+            let mut out = String::from("While you were working, the user sent these follow-up messages in this conversation. Treat them together, in order (later messages may refine or override earlier ones):\n");
+            for (i, (text, _)) in many.iter().enumerate() {
+                out.push_str(&format!("\n[{}] {}\n", i + 1, text.trim()));
+            }
+            out
+        }
+    }
+}
+
+#[cfg(test)]
+mod batching_tests {
+    use super::*;
+
+    fn q(items: &[&str]) -> VecDeque<(String, Option<String>)> {
+        items.iter().map(|s| (s.to_string(), None)).collect()
+    }
+
+    #[test]
+    fn batches_plain_messages_and_isolates_commands() {
+        let mut queue = q(&["fix the test", "also update docs", "/compact", "then push"]);
+        let first = take_batch(&mut queue);
+        assert_eq!(first.len(), 2);
+        assert_eq!(take_batch(&mut queue)[0].0, "/compact");
+        assert_eq!(take_batch(&mut queue)[0].0, "then push");
+        assert!(take_batch(&mut queue).is_empty());
+    }
+
+    #[test]
+    fn single_message_is_sent_unchanged() {
+        assert_eq!(merged_prompt(&[("hello".into(), None)]), "hello");
+    }
+
+    #[test]
+    fn merged_prompt_numbers_messages_in_order() {
+        let p = merged_prompt(&[("one".into(), None), ("two".into(), None)]);
+        assert!(p.contains("[1] one") && p.contains("[2] two"));
+        assert!(p.find("[1]").unwrap() < p.find("[2]").unwrap());
     }
 }
