@@ -52,6 +52,10 @@ pub struct Config {
     /// Compact an agent's context after a turn once it fills this share of
     /// the context window (percent). 0 disables daemon-triggered compaction.
     pub auto_compact_pct: u32,
+    /// Also compact once the context reaches this many tokens, whatever the
+    /// window: every model call uploads the whole context, so a smaller one
+    /// saves egress (and cache-read cost). 0 = no cap.
+    pub auto_compact_tokens: u64,
     /// Context window assumed for Claude models (1M for `[1m]` models).
     pub claude_context_window: u64,
     /// Automatic retries of a failed, empty or stalled turn (0 = off).
@@ -132,6 +136,7 @@ impl Config {
             agent_oom_score_adj: env("PASEO_AGENT_OOM_SCORE_ADJ").and_then(|v| v.parse().ok()).unwrap_or(500).clamp(0, 1000),
             agent_low_io: env_bool("PASEO_AGENT_LOW_IO").unwrap_or(true),
             auto_compact_pct: env("PASEO_AUTO_COMPACT_PCT").and_then(|v| v.parse().ok()).unwrap_or(70).min(99),
+            auto_compact_tokens: env("PASEO_AUTO_COMPACT_TOKENS").and_then(|v| v.parse().ok()).unwrap_or(150_000),
             claude_context_window: env("PASEO_CLAUDE_CONTEXT_WINDOW").and_then(|v| v.parse().ok()).unwrap_or(200_000),
             retry_max: env("PASEO_RETRY_MAX").and_then(|v| v.parse().ok()).unwrap_or(3),
             retry_base: env_secs("PASEO_RETRY_BASE_SECS", 5),

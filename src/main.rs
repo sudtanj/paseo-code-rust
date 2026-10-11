@@ -3,6 +3,7 @@ mod cleanup;
 mod config;
 mod daemon_config;
 mod e2ee;
+mod egress;
 mod files;
 mod git_actions;
 mod manager;

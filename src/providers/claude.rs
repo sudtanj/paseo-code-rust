@@ -162,6 +162,12 @@ impl ClaudePool {
         if let Some(prompt) = spec.system_prompt.as_deref().filter(|p| !p.is_empty()) {
             cmd.args(["--append-system-prompt", prompt]);
         }
+        // Skip telemetry, error reporting and update checks: they only cost
+        // egress here (the binary is pinned in the image). Set it in the
+        // daemon's environment to override.
+        if std::env::var_os("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC").is_none() {
+            cmd.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
+        }
         cmd.current_dir(&spec.cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
         super::deprioritize(&mut cmd, &self.cfg);
         let mut child = cmd.spawn().map_err(|e| format!("failed to start {}: {e}", self.cfg.claude_bin))?;

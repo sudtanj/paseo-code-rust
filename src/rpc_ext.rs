@@ -363,6 +363,7 @@ impl Manager {
             "codex": { "appServerRunning": self.codex.is_running(), "maxActive": self.cfg.codex_max_active, "keepWarm": self.cfg.codex_keep_warm },
             "agents": { "total": self.agents.len(), "running": self.agents.values().filter(|a| a.status == "running").count() },
             "autoCompactPct": self.cfg.auto_compact_pct,
+            "autoCompactTokens": self.cfg.auto_compact_tokens,
             "agentNice": self.cfg.agent_nice,
             "daemonRssKib": rss_kib(),
         })
@@ -429,8 +430,14 @@ impl Manager {
             format!("agents: {}", rt["agents"]),
             format!("projects: {}", self.projects.len()),
             format!("agent priority: nice {}, oom_score_adj {}, low io {}", cfg.agent_nice, cfg.agent_oom_score_adj, cfg.agent_low_io),
-            format!("auto-compact: {}", if cfg.auto_compact_pct == 0 { "off".into() } else { format!("at {}% of context", cfg.auto_compact_pct) }),
+            format!("auto-compact: {}", if cfg.auto_compact_pct == 0 { "off".into() } else { format!("at {}% of context or {} tokens", cfg.auto_compact_pct, cfg.auto_compact_tokens) }),
         ];
+        let sent = crate::egress::snapshot();
+        let total: u64 = sent.iter().map(|s| s.2).sum();
+        lines.push(format!("sent to apps since start: {} KiB in {} messages", total / 1024, sent.iter().map(|s| s.1).sum::<u64>()));
+        for (kind, n, bytes) in sent.iter().take(8) {
+            lines.push(format!("  {kind}: {} KiB, {n} messages", bytes / 1024));
+        }
         for a in self.agents.values().filter(|a| a.status != "idle") {
             lines.push(format!("agent {} [{}] {}: {}", a.rec.id, a.rec.provider, a.status, a.rec.last_error.as_deref().unwrap_or("")));
         }

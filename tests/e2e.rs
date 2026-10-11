@@ -62,9 +62,17 @@ done
         "      printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'\n",
         "      ;;\n  esac\ndone\n"
     );
+    // Twenty streamed text deltas in quick succession: exercises delta batching.
+    let mut stream = String::from("#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"type\":\"user\"'*)\n");
+    stream.push_str("      printf '%s\\n' '{\"type\":\"stream_event\",\"event\":{\"type\":\"message_start\",\"message\":{\"id\":\"m1\"}}}'\n");
+    for i in 0..20 {
+        stream.push_str(&format!("      printf '%s\\n' '{{\"type\":\"stream_event\",\"event\":{{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"w{i} \"}}}}}}'\n"));
+    }
+    stream.push_str("      printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'\n      ;;\n  esac\ndone\n");
     let body = match mode {
         "hang" => hanging.to_string(),
         "tool" => tool.to_string(),
+        "stream" => stream,
         _ => script.to_string(),
     };
     std::fs::write(&path, body).unwrap();
@@ -551,4 +559,44 @@ async fn upload_file_and_attach_it_with_an_image() {
     assert!(bubble.starts_with("what is in these?"), "{bubble}");
     assert!(bubble.contains("📎") && bubble.contains("notes.txt") && bubble.contains("image.png"), "{bubble}");
     assert!(!bubble.contains("Path:"), "agent notes stay out of the bubble: {bubble}");
+}
+
+#[tokio::test]
+async fn streamed_text_is_sent_in_batches() {
+    let d = start_at(unique_dir("stream"), None, "stream");
+    let cwd = d.dir.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    send(
+        &mut ws,
+        session(json!({ "type": "create_agent_request", "requestId": "s1", "config": { "provider": "claude", "cwd": cwd.to_string_lossy(), "modeId": "bypassPermissions" }, "initialPrompt": "talk" })),
+    )
+    .await;
+    let agent_id = recv_until(&mut ws, |v| {
+        let p = &v["message"]["payload"];
+        (v["message"]["type"] == "status" && p["status"] == "agent_created").then(|| p["agentId"].as_str().unwrap().to_string())
+    })
+    .await;
+    // Count the assistant text messages until the turn ends.
+    let mut texts = Vec::new();
+    recv_until(&mut ws, |v| {
+        let ev = &v["message"]["payload"]["event"];
+        if v["message"]["type"] != "agent_stream" {
+            return None;
+        }
+        if ev["type"] == "timeline" && ev["item"]["type"] == "assistant_message" {
+            texts.push(ev["item"]["text"].as_str().unwrap_or("").to_string());
+        }
+        (ev["type"] == "turn_completed").then_some(())
+    })
+    .await;
+    let expected: String = (0..20).map(|i| format!("w{i} ")).collect();
+    assert_eq!(texts.concat(), expected);
+    assert!(texts.len() < 20, "deltas were not batched: {} messages", texts.len());
+    // The stored row has the whole text, before the turn ended.
+    let tail = rpc(&mut ws, json!({ "type": "fetch_agent_timeline_request", "requestId": "s2", "agentId": agent_id, "direction": "tail", "limit": 50 }), "fetch_agent_timeline_response").await;
+    let rows: Vec<&Value> = tail["entries"].as_array().unwrap().iter().filter(|e| e["item"]["type"] == "assistant_message").collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["item"]["text"], expected);
 }

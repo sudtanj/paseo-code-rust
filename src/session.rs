@@ -152,10 +152,12 @@ pub async fn run(ctx: Arc<Ctx>, mut inbound: mpsc::Receiver<Inbound>, outbound: 
                 }
             }
             Some(out) = reply_rx.recv() => {
+                crate::egress::count(&out);
                 if outbound.send(out).await.is_err() { return; }
             }
             ev = events.recv() => match ev {
                 Ok(out) => {
+                    crate::egress::count(&out);
                     if outbound.send(out).await.is_err() { return; }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {

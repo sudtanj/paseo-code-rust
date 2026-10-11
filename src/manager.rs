@@ -35,6 +35,33 @@ fn cli_label(cli: &str) -> &'static str {
     if cli == "codex" { "Codex" } else { "Claude Code" }
 }
 
+/// How long streamed text is held to be sent as one message.
+const CHUNK_DELAY: Duration = Duration::from_millis(150);
+
+async fn sleep_until_opt(deadline: Option<Instant>) {
+    match deadline {
+        Some(d) => tokio::time::sleep_until(d.into()).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The agent of an event that must not overtake that agent's buffered text
+/// (everything but timeline items, which buffer or flush themselves).
+fn other_event_agent(ev: &ProviderEvent) -> Option<&str> {
+    match ev {
+        ProviderEvent::Timeline { .. } => None,
+        ProviderEvent::SessionStarted { agent_id, .. }
+        | ProviderEvent::TurnStarted { agent_id, .. }
+        | ProviderEvent::Permission { agent_id, .. }
+        | ProviderEvent::Usage { agent_id, .. }
+        | ProviderEvent::Spend { agent_id, .. }
+        | ProviderEvent::TurnCompleted { agent_id }
+        | ProviderEvent::TurnFailed { agent_id, .. }
+        | ProviderEvent::TurnCanceled { agent_id, .. }
+        | ProviderEvent::ProcessExited { agent_id, .. } => Some(agent_id),
+    }
+}
+
 pub enum Cmd {
     /// A session-level message (already unwrapped from the `session` envelope).
     Rpc { msg: Value, out: Out },
@@ -125,6 +152,11 @@ pub struct Manager {
     pub daemon_config: crate::daemon_config::DaemonConfig,
     /// Tokens and cost per provider and model.
     pub usage: crate::usage::Ledger,
+    /// Streamed text not sent yet, per agent: (kind, text). Deltas arrive a few
+    /// tokens at a time; sending them in ~150 ms batches cuts the messages (and
+    /// their envelopes) sent to the app by an order of magnitude.
+    chunks: HashMap<String, (String, String)>,
+    chunk_deadline: Option<Instant>,
 }
 
 /// A client blocked in `wait_for_finish_request` until the agent stops
@@ -169,7 +201,7 @@ impl Manager {
         crate::log!("loaded {} agents, {} projects, {} workspaces", agents.len(), projects.len(), workspaces.len());
         let claude = ClaudePool::new(cfg.clone(), events_tx.clone());
         let codex = Codex::new(cfg.clone(), events_tx.clone());
-        let mut manager = Manager { cfg, server_id, store, agents, claude, codex, active_cli: None, running: HashSet::new(), cli_queue: VecDeque::new(), claude_warm_at: None, codex_warm_at: None, bcast, events_tx, agents_dirty: false, pairing_url, projects, workspaces, cmds_tx, checkout: crate::checkout::Watcher::start(), started_at: now_iso(), waiters: Vec::new(), push_tokens, clients: Vec::new(), daemon_config, usage };
+        let mut manager = Manager { cfg, server_id, store, agents, claude, codex, active_cli: None, running: HashSet::new(), cli_queue: VecDeque::new(), claude_warm_at: None, codex_warm_at: None, bcast, events_tx, agents_dirty: false, pairing_url, projects, workspaces, cmds_tx, checkout: crate::checkout::Watcher::start(), started_at: now_iso(), waiters: Vec::new(), push_tokens, clients: Vec::new(), daemon_config, usage, chunks: HashMap::new(), chunk_deadline: None };
         manager.migrate_agent_workspaces();
         (manager, events_rx)
     }
@@ -215,6 +247,7 @@ impl Manager {
                 },
                 Some(ev) = events.recv() => self.handle_event(ev),
                 _ = tick.tick() => self.housekeeping(),
+                _ = sleep_until_opt(self.chunk_deadline) => self.flush_chunks(),
                 _ = &mut shutdown => break,
             }
             self.resolve_waiters();
@@ -300,6 +333,7 @@ impl Manager {
     }
 
     pub fn flush_all(&mut self) {
+        self.flush_chunks();
         for agent in self.agents.values_mut() {
             agent.flush(&self.store);
         }
@@ -344,7 +378,48 @@ impl Manager {
     }
 
     /// Append a timeline item, merging chunks / tool updates into existing rows.
+    /// Append a timeline item, first sending any streamed text still buffered
+    /// for the agent so rows keep their order.
     pub fn append_item(&mut self, agent_id: &str, item: Value) {
+        self.flush_chunk(agent_id);
+        self.append_now(agent_id, item);
+    }
+
+    /// Hold a streamed text delta briefly and merge it with the next ones;
+    /// anything else is appended at once (after the held text).
+    fn buffer_chunk(&mut self, agent_id: &str, item: Value) {
+        let kind = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let text = item.get("text").and_then(|t| t.as_str());
+        let (Some(text), true) = (text, item.as_object().map(|o| o.len() == 2).unwrap_or(false) && matches!(kind, "assistant_message" | "reasoning")) else {
+            return self.append_item(agent_id, item);
+        };
+        match self.chunks.get_mut(agent_id).filter(|(k, _)| k == kind) {
+            Some((_, held)) => held.push_str(text),
+            None => {
+                self.flush_chunk(agent_id);
+                self.chunks.insert(agent_id.to_string(), (kind.to_string(), text.to_string()));
+            }
+        }
+        if self.chunk_deadline.is_none() {
+            self.chunk_deadline = Some(Instant::now() + CHUNK_DELAY);
+        }
+    }
+
+    fn flush_chunk(&mut self, agent_id: &str) {
+        if let Some((kind, text)) = self.chunks.remove(agent_id) {
+            self.append_now(agent_id, json!({ "type": kind, "text": text }));
+        }
+    }
+
+    fn flush_chunks(&mut self) {
+        self.chunk_deadline = None;
+        let ids: Vec<String> = self.chunks.keys().cloned().collect();
+        for id in ids {
+            self.flush_chunk(&id);
+        }
+    }
+
+    fn append_now(&mut self, agent_id: &str, item: Value) {
         let item = crate::snapshot::clean(item);
         let store = &self.store;
         let Some(agent) = self.agents.get_mut(agent_id) else { return };
@@ -572,8 +647,8 @@ impl Manager {
         });
     }
 
-    /// True when the agent's last turn left its context window at or past
-    /// `auto_compact_pct`.
+    /// True when the agent's last turn left its context at or past
+    /// `auto_compact_pct` of the window or `auto_compact_tokens`.
     fn needs_compaction(&self, agent_id: &str) -> bool {
         let pct = self.cfg.auto_compact_pct as u64;
         let Some(a) = self.agents.get(agent_id) else { return false };
@@ -582,16 +657,15 @@ impl Manager {
         }
         let Some(usage) = &a.rec.last_usage else { return false };
         let get = |k: &str| usage.get(k).and_then(|v| v.as_u64()).filter(|n| *n > 0);
-        match (get("contextWindowUsedTokens"), get("contextWindowMaxTokens")) {
-            (Some(used), Some(max)) => used * 100 >= max * pct,
-            _ => false,
-        }
+        let Some(used) = get("contextWindowUsedTokens") else { return false };
+        let cap = self.cfg.auto_compact_tokens;
+        (cap > 0 && used >= cap) || get("contextWindowMaxTokens").map(|max| used * 100 >= max * pct).unwrap_or(false)
     }
 
     /// Run `/compact` as its own turn, ahead of the agent's queued prompts,
     /// so the next prompt is sent with a summarised (smaller) context.
     fn start_compaction(&mut self, agent_id: &str) {
-        let provider = {
+        let (provider, used) = {
             let Some(agent) = self.agents.get_mut(agent_id) else { return };
             let turn_id = new_id();
             agent.status = "running";
@@ -600,14 +674,19 @@ impl Manager {
             agent.last_event = Instant::now();
             agent.retry_at = None;
             // Wait for fresh numbers before considering another compaction.
-            if let Some(Value::Object(u)) = agent.rec.last_usage.as_mut() {
-                u.remove("contextWindowUsedTokens");
-            }
-            agent.rec.provider.clone()
+            let used = match agent.rec.last_usage.as_mut() {
+                Some(Value::Object(u)) => u.remove("contextWindowUsedTokens").and_then(|v| v.as_u64()),
+                _ => None,
+            };
+            (agent.rec.provider.clone(), used)
         };
         crate::log!("auto-compacting context for agent {agent_id}");
         let turn_id = self.agents[agent_id].active_turn.as_ref().map(|t| t.0.clone());
-        let note = json!({ "type": "notification", "level": "info", "message": format!("Context is over {}% full; compacting to save tokens", self.cfg.auto_compact_pct) });
+        let message = match used {
+            Some(n) => format!("Context is at {}K tokens; compacting to save tokens and data", n / 1000),
+            None => "Compacting the context to save tokens and data".to_string(),
+        };
+        let note = json!({ "type": "notification", "level": "info", "message": message });
         self.append_item(agent_id, note);
         self.stream(agent_id, &provider, json!({ "type": "turn_started", "provider": provider, "turnId": turn_id }));
         self.touch(agent_id);
@@ -617,6 +696,7 @@ impl Manager {
 
     /// End the active turn. `Ok(None)` completed, `Ok(Some(reason))` canceled, `Err` failed.
     pub fn finish_turn(&mut self, agent_id: &str, outcome: Result<Option<String>, String>) {
+        self.flush_chunk(agent_id);
         let compacting = match self.agents.get_mut(agent_id) {
             // A scheduled retry owns the turn; late events from the dead attempt are ignored.
             Some(a) if a.status == "running" && a.retry_at.is_none() => std::mem::take(&mut a.compacting),
@@ -899,6 +979,9 @@ impl Manager {
     }
 
     fn handle_event(&mut self, ev: ProviderEvent) {
+        if let Some(id) = other_event_agent(&ev) {
+            self.flush_chunk(id);
+        }
         match ev {
             ProviderEvent::SessionStarted { agent_id, session_id } => {
                 if let Some(a) = self.agents.get_mut(&agent_id) {
@@ -917,7 +1000,7 @@ impl Manager {
                     if matches!(item.get("type").and_then(|t| t.as_str()), Some("assistant_message" | "reasoning" | "tool_call")) {
                         a.produced = true;
                     }
-                    self.append_item(&agent_id, item);
+                    self.buffer_chunk(&agent_id, item);
                 }
             }
             ProviderEvent::Permission { agent_id, request, reply } => {
