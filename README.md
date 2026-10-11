@@ -147,10 +147,12 @@ paseo-lite is built and maintained by one person in their spare time. If it save
 
 - **GitHub Sponsors:** https://github.com/sponsors/sudtanj (monthly or one-time)
 - **Star the repo**, report bugs and share it: it helps more than you'd think.
-- **Commercial use, hosted/managed setups, custom features or consulting:** contact [@sudtanj](https://github.com/sudtanj) on GitHub.
+- **Commercial license, hosted/managed setups, custom features or consulting:** contact [@sudtanj](https://github.com/sudtanj) on GitHub.
 
 ## License
 
-Copyright (c) 2025-present Sudono Tanjung, **all rights reserved** for the modifications and original code in this repository. See [LICENSE](LICENSE).
+**Source-available: free for personal use, paid for commercial use.**
 
-paseo-lite is derived from [Paseo](https://github.com/getpaseo/paseo) (Copyright (c) Mohamed Boudra, Apache-2.0). The upstream-derived portions stay under [Apache-2.0](LICENSE-APACHE), and versions published before the license change remain available under it. See [NOTICE](NOTICE).
+- Modifications and original code are under the [PolyForm Noncommercial License 1.0.0](LICENSE-POLYFORM-NONCOMMERCIAL.md), Copyright (c) 2025-present Sudono Tanjung. You can run, read and modify it for personal and other noncommercial use at no cost.
+- **Commercial use** (in or for a business, as a hosted service, or in a commercial product) needs a paid commercial license: contact [@sudtanj](https://github.com/sudtanj).
+- The portions derived from [Paseo](https://github.com/getpaseo/paseo) (Copyright (c) Mohamed Boudra) stay under [Apache-2.0](LICENSE-APACHE), and versions published before the license change remain available under it. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

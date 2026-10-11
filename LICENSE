@@ -3,37 +3,40 @@ paseo-lite licensing
 
 This repository contains two layers of work, under different terms.
 
-1. Upstream-derived code
-   paseo-lite is derived from Paseo (https://github.com/getpaseo/paseo),
-   Copyright (c) 2025-present Mohamed Boudra. Those portions (the relay
-   transport, the E2EE channel, the wire-protocol shapes and anything else
-   ported from Paseo) remain licensed under the Apache License, Version 2.0,
-   reproduced in LICENSE-APACHE. That license, and the rights it grants to
-   recipients of versions published under it, are unaffected by this file.
+1. Modifications and original work: PolyForm Noncommercial 1.0.0
+   (SPDX: PolyForm-Noncommercial-1.0.0)
 
-2. Modifications and original work
+   Required Notice: Copyright (c) 2025-present Sudono Tanjung (https://github.com/sudtanj)
+
    All modifications and original code in this repository authored by
-   Sudono Tanjung ("sudtanj"), starting with the commit that introduced this
-   file, are Copyright (c) 2025-present Sudono Tanjung. ALL RIGHTS RESERVED.
+   Sudono Tanjung, from the commit that introduced this file onward, are
+   source-available under the PolyForm Noncommercial License 1.0.0, the full
+   text of which is in LICENSE-POLYFORM-NONCOMMERCIAL.md.
 
-   No license is granted to anyone other than the copyright holder to use,
-   copy, modify, merge, publish, distribute, sublicense, host, offer as a
-   service, or sell these modifications and original work, except:
-     - to the extent Apache-2.0 section 4 and the license of the upstream
-       portions require otherwise for the upstream-derived code, and
-     - as the copyright holder grants in writing.
+   In plain words:
+     - FREE for personal use: running it for yourself, studying it,
+       hobby projects, research, education and experimentation.
+       Noncommercial organisations (charities, schools, public research
+       bodies) are covered too, as the license defines.
+     - NOT free for commercial use. Using it in or for a business,
+       offering it as a (hosted) service, bundling it into a commercial
+       product, or using it to make money in any way needs a paid
+       commercial license from the copyright holder.
+     - Redistribution must keep this notice and the license text.
 
-   Viewing the source on GitHub and the rights GitHub's Terms of Service give
-   to users of the platform (viewing and forking within GitHub) are not
-   restricted by this file.
+   COMMERCIAL LICENSES: contact the copyright holder via
+   https://github.com/sudtanj (GitHub profile / sponsors page).
 
-   For any other use, including commercial use, ask the copyright holder:
-   https://github.com/sudtanj
+2. Upstream-derived code: Apache License 2.0
+   paseo-lite is derived from Paseo (https://github.com/getpaseo/paseo),
+   Copyright (c) 2025-present Mohamed Boudra. The portions derived from
+   Paseo (the relay transport, the E2EE channel, the wire-protocol shapes
+   and anything else ported from it) remain under the Apache License,
+   Version 2.0, reproduced in LICENSE-APACHE. This file does not change
+   that license or the rights it gives.
 
-Because this repository is public, versions published before this file was
-added (all earlier commits) were distributed under Apache-2.0 and remain
-available under it. This notice applies from this commit onward.
+Versions published before this file was added (all earlier commits) were
+distributed under Apache-2.0 and remain available under it. These terms
+apply from this commit onward.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
