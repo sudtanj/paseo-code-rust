@@ -43,6 +43,12 @@ fn server_info(ctx: &Ctx) -> Arc<str> {
                 "projectCreateDirectory": true,
                 "projectGithubClone": true,
                 "workspaceGithubRepositorySearch": true,
+                "projectRemove": true,
+                "agentThinkingUpdate": true,
+                "agentTimelinePromptIndex": true,
+                "daemonStatusRpc": true,
+                "daemonDiagnostics": true,
+                "pushTokenRevocation": true,
             },
         } } })
         .to_string(),

@@ -18,9 +18,53 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 
-const PING_INTERVAL: Duration = Duration::from_secs(10);
-const STALE_AFTER: Duration = Duration::from_secs(30);
+/// Short ping/stale windows so a dead control socket (NAT timeout, network
+/// switch) is noticed and replaced within seconds instead of half a minute.
+const PING_INTERVAL: Duration = Duration::from_secs(5);
+const STALE_AFTER: Duration = Duration::from_secs(15);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Reconnect backoff: immediate first retry, then doubling up to the cap.
+const BACKOFF_START: Duration = Duration::from_millis(250);
+const BACKOFF_MAX: Duration = Duration::from_secs(10);
+/// Max queued outbound frames written per flush.
+const WRITE_BATCH: usize = 64;
+
+/// One TLS config for every relay socket: the root store is built once and
+/// rustls' in-memory session cache lets reconnects and per-client data
+/// sockets resume TLS sessions (one round trip less, much less CPU).
+/// Also used for outbound HTTPS (push notifications).
+pub fn tls_config() -> Arc<rustls::ClientConfig> {
+    static CONFIG: std::sync::OnceLock<Arc<rustls::ClientConfig>> = std::sync::OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            Arc::new(rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth())
+        })
+        .clone()
+}
+
+fn tls_connector() -> tokio_tungstenite::Connector {
+    tokio_tungstenite::Connector::Rustls(tls_config())
+}
+
+type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Open a relay socket with Nagle disabled (small JSON frames go out
+/// immediately instead of waiting up to 40ms for an ACK) and the shared TLS config.
+async fn connect(target: &str, timeout: Duration) -> Result<Ws, String> {
+    let fut = tokio_tungstenite::connect_async_tls_with_config(target, None, true, Some(tls_connector()));
+    let (ws, _) = tokio::time::timeout(timeout, fut).await.map_err(|_| "connect timeout".to_string())?.map_err(|e| e.to_string())?;
+    Ok(ws)
+}
+
+/// Add up to ±20% jitter so many daemons don't reconnect in lockstep after a relay restart.
+fn jitter(d: Duration) -> Duration {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|t| t.subsec_nanos()).unwrap_or(0);
+    let pct = 80 + (nanos % 41) as u64;
+    d * pct as u32 / 100
+}
 
 fn url(cfg: &Config, server_id: &str, connection_id: Option<&str>) -> String {
     let scheme = if cfg.relay_use_tls { "wss" } else { "ws" };
@@ -37,30 +81,35 @@ type DataSockets = Arc<Mutex<HashMap<String, JoinHandle<()>>>>;
 
 pub async fn run(ctx: Arc<Ctx>, cfg: Config, identity: Arc<DaemonIdentity>) {
     let data: DataSockets = Arc::new(Mutex::new(HashMap::new()));
-    let mut attempt: u64 = 0;
+    let mut backoff = Duration::ZERO;
     loop {
-        match control_session(&ctx, &cfg, &identity, &data).await {
-            Ok(()) => attempt = 0,
-            Err(e) => {
-                attempt += 1;
-                crate::warn!("relay control disconnected: {e}");
-            }
+        let mut connected = false;
+        let started = Instant::now();
+        let err = control_session(&ctx, &cfg, &identity, &data, &mut connected).await.err().unwrap_or_else(|| "closed".into());
+        // A session that stayed up was healthy, so the next attempt starts
+        // fresh: a drop after hours of uptime reconnects at once instead of
+        // inheriting an old backoff. A relay that accepts and instantly
+        // closes still backs off.
+        if connected && started.elapsed() >= Duration::from_secs(5) {
+            backoff = Duration::ZERO;
         }
-        let delay = Duration::from_secs((attempt.max(1)).min(30));
-        tokio::time::sleep(delay).await;
+        crate::warn!("relay control disconnected: {err}; reconnecting in {}ms", backoff.as_millis());
+        if !backoff.is_zero() {
+            tokio::time::sleep(jitter(backoff)).await;
+        }
+        backoff = if backoff.is_zero() { BACKOFF_START } else { (backoff * 2).min(BACKOFF_MAX) };
     }
 }
 
-async fn control_session(ctx: &Arc<Ctx>, cfg: &Config, identity: &Arc<DaemonIdentity>, data: &DataSockets) -> Result<(), String> {
+async fn control_session(ctx: &Arc<Ctx>, cfg: &Config, identity: &Arc<DaemonIdentity>, data: &DataSockets, connected: &mut bool) -> Result<(), String> {
     let target = url(cfg, &identity.server_id, None);
-    let (ws, _) = tokio::time::timeout(Duration::from_secs(10), tokio_tungstenite::connect_async(target.as_str()))
-        .await
-        .map_err(|_| "connect timeout".to_string())?
-        .map_err(|e| e.to_string())?;
+    let ws = connect(&target, CONNECT_TIMEOUT).await?;
+    *connected = true;
+    crate::log!("relay connected ({})", cfg.relay_endpoint);
     let (mut sink, mut stream) = ws.split();
     let mut last_seen = Instant::now();
     let mut ping = tokio::time::interval(PING_INTERVAL);
-    let mut ready = false;
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             _ = ping.tick() => {
@@ -83,10 +132,6 @@ async fn control_session(ctx: &Arc<Ctx>, cfg: &Config, identity: &Arc<DaemonIden
                     _ => continue,
                 };
                 let Ok(msg) = serde_json::from_str::<Value>(&text) else { continue };
-                if !ready {
-                    ready = true;
-                    crate::log!("relay connected ({})", cfg.relay_endpoint);
-                }
                 match msg.get("type").and_then(|t| t.as_str()) {
                     Some("ping") => {
                         let pong = json!({ "type": "pong", "ts": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0) });
@@ -154,10 +199,7 @@ fn ready_frame(binary_ciphertext: bool) -> Message {
 
 async fn data_socket(ctx: Arc<Ctx>, cfg: &Config, identity: Arc<DaemonIdentity>, connection_id: &str) -> Result<(), String> {
     let target = url(cfg, &identity.server_id, Some(connection_id));
-    let (ws, _) = tokio::time::timeout(HANDSHAKE_TIMEOUT, tokio_tungstenite::connect_async(target.as_str()))
-        .await
-        .map_err(|_| "open timeout".to_string())?
-        .map_err(|e| e.to_string())?;
+    let ws = connect(&target, HANDSHAKE_TIMEOUT).await?;
     let (mut sink, mut stream) = ws.split();
 
     // Handshake: first text frame must be the client's e2ee_hello.
@@ -187,7 +229,16 @@ async fn data_socket(ctx: Arc<Ctx>, cfg: &Config, identity: Arc<DaemonIdentity>,
             out = out_rx.recv() => {
                 let Some(out) = out else { break Ok(()) };
                 // JSON is text plaintext => base64 ciphertext in a text frame.
-                if let Err(e) = sink.send(Message::Text(channel.encrypt_text(&out))).await {
+                // Queue whatever else is already waiting and flush once, so a
+                // burst of stream updates costs one write instead of one each.
+                let mut res = sink.feed(Message::Text(channel.encrypt_text(&out))).await;
+                let mut n = 1;
+                while res.is_ok() && n < WRITE_BATCH {
+                    let Ok(more) = out_rx.try_recv() else { break };
+                    res = sink.feed(Message::Text(channel.encrypt_text(&more))).await;
+                    n += 1;
+                }
+                if let Err(e) = res.and(sink.flush().await) {
                     break Err(e.to_string());
                 }
             }

@@ -1,12 +1,15 @@
 mod checkout;
+mod cleanup;
 mod config;
 mod e2ee;
 mod files;
 mod manager;
 mod projects;
+mod push;
 mod providers;
 mod relay;
 mod rpc;
+mod rpc_ext;
 mod server;
 mod session;
 mod snapshot;
@@ -32,7 +35,7 @@ ENVIRONMENT (selection):
     PASEO_HOSTNAMES          extra allowed Host names (comma separated, .suffix ok)
     PASEO_LOG_CONSOLE_LEVEL  debug|info|warn|error
     PASEO_RELAY_ENDPOINT     default relay.paseo.sh:443
-    PASEO_CLAUDE_MAX_LIVE    max concurrent claude processes (default 3)
+    PASEO_CLAUDE_MAX_LIVE    max concurrent claude processes (default 1; only one CLI runs at a time)
     PASEO_CLAUDE_IDLE_SECS   keep-warm time for an idle claude process (default 90)
     PASEO_CODEX_IDLE_SECS    idle time before the shared codex app-server exits (default 300)
     PASEO_DEFAULT_SYSTEM_PROMPT  instructions for every agent (default: do not run/test the app locally; set empty to disable)

@@ -8,7 +8,7 @@ use crate::util::{new_id, now_iso};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
-fn s(v: &Value, key: &str) -> Option<String> {
+pub(crate) fn s(v: &Value, key: &str) -> Option<String> {
     v.get(key).and_then(|x| x.as_str()).map(|x| x.to_string())
 }
 
@@ -21,7 +21,7 @@ fn expand_home(path: &str) -> String {
     path.to_string()
 }
 
-fn normalize_dir(path: &str) -> Result<String, String> {
+pub(crate) fn normalize_dir(path: &str) -> Result<String, String> {
     let expanded = expand_home(path.trim());
     let canon = std::fs::canonicalize(&expanded).map_err(|e| format!("{expanded}: {e}"))?;
     if !canon.is_dir() {
@@ -31,7 +31,7 @@ fn normalize_dir(path: &str) -> Result<String, String> {
 }
 
 impl Manager {
-    fn resolve(&self, key: &str) -> Option<String> {
+    pub(crate) fn resolve(&self, key: &str) -> Option<String> {
         if self.agents.contains_key(key) {
             return Some(key.to_string());
         }
@@ -184,7 +184,14 @@ impl Manager {
             "list_provider_models_request" => {
                 let provider = s(&msg, "provider").unwrap_or_default();
                 let out = out.clone();
-                if provider == "codex" {
+                if provider == "codex" && !self.codex_may_start() {
+                    // Claude Code holds the machine: answer from the cache, never start Codex.
+                    let (models, error) = match self.codex.cached_models() {
+                        Some(m) => (m, Value::Null),
+                        None => (json!([]), json!("Codex models load the first time Codex runs")),
+                    };
+                    reply(&out, json!({ "type": "list_provider_models_response", "payload": { "provider": "codex", "models": crate::snapshot::clean(models), "error": error, "fetchedAt": now_iso(), "requestId": rid } }));
+                } else if provider == "codex" {
                     let codex = self.codex.clone();
                     tokio::spawn(async move {
                         let (models, error) = match codex.list_models().await {
@@ -225,8 +232,10 @@ impl Manager {
             }
             "refresh_providers_snapshot_request" => {
                 reply(out, json!({ "type": "refresh_providers_snapshot_response", "payload": { "requestId": rid, "acknowledged": true } }));
-                self.codex.clear_models();
-                self.push_codex_models();
+                if self.codex_may_start() {
+                    self.codex.clear_models();
+                    self.push_codex_models();
+                }
             }
             "fetch_workspaces_request" => {
                 let project = msg.pointer("/filter/projectId").and_then(|v| v.as_str()).map(String::from);
@@ -251,21 +260,14 @@ impl Manager {
                 // projectId is the project root path; fall back to the directory itself.
                 let root = s(&source, "projectId").filter(|p| self.projects.iter().any(|r| &r.root_path == p)).unwrap_or_else(|| dir.clone());
                 if !self.projects.iter().any(|r| r.root_path == root) {
-                    self.register_project(&root);
+                    self.register_project(&root, false);
                 }
                 let id = self.create_workspace(&root, &dir);
                 self.publish_workspace(&id);
                 crate::log!("workspace {id} created in {dir}");
                 reply(out, json!({ "type": "workspace.create.response", "payload": { "requestId": rid, "workspace": self.workspace_json(&id), "setupTerminalId": null, "error": null } }));
             }
-            "archive_workspace_request" => {
-                let id = s(&msg, "workspaceId").unwrap_or_default();
-                let payload = match self.archive_workspace(&id) {
-                    Ok(at) => json!({ "requestId": rid, "workspaceId": id, "archivedAt": at, "error": null }),
-                    Err(e) => json!({ "requestId": rid, "workspaceId": id, "archivedAt": null, "error": e }),
-                };
-                reply(out, json!({ "type": "archive_workspace_response", "payload": payload }));
-            }
+            "archive_workspace_request" => self.archive_workspace_request(&msg, &rid, out),
             "workspace.title.set.request" => {
                 let id = s(&msg, "workspaceId").unwrap_or_default();
                 let title = s(&msg, "title").map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
@@ -324,7 +326,7 @@ impl Manager {
             "project.add.request" => {
                 let requested = s(&msg, "cwd").unwrap_or_default();
                 let payload = match normalize_dir(&requested) {
-                    Ok(cwd) => json!({ "requestId": rid, "project": self.register_project(&cwd), "error": null }),
+                    Ok(cwd) => json!({ "requestId": rid, "project": self.register_project(&cwd, false), "error": null }),
                     Err(e) => json!({ "requestId": rid, "project": null, "error": format!("Directory not found: {e}"), "errorCode": "directory_not_found" }),
                 };
                 reply(out, json!({ "type": "project.add.response", "payload": payload }));
@@ -333,7 +335,7 @@ impl Manager {
                 let parent = s(&msg, "parentPath").unwrap_or_default();
                 let name = s(&msg, "name").unwrap_or_default();
                 let payload = match crate::projects::create_directory(&parent, &name) {
-                    Ok(path) => json!({ "requestId": rid, "directoryPath": path, "project": self.register_project(&path), "error": null, "errorCode": null }),
+                    Ok(path) => json!({ "requestId": rid, "directoryPath": path, "project": self.register_project(&path, true), "error": null, "errorCode": null }),
                     Err((code, error)) => json!({ "requestId": rid, "directoryPath": null, "project": null, "error": error, "errorCode": code }),
                 };
                 reply(out, json!({ "type": "project.create_directory.response", "payload": payload }));
@@ -412,7 +414,19 @@ impl Manager {
                 };
                 reply(out, json!({ "type": "daemon.get_pairing_offer.response", "payload": { "requestId": rid, "url": url, "qr": qr, "relayEnabled": self.pairing_url.is_some() } }));
             }
-            "client_heartbeat" | "register_push_token" | "abort_request" => {}
+            "client_heartbeat" => self.client_heartbeat(&msg, out),
+            "register_push_token" => {
+                if let Some(token) = s(&msg, "token") {
+                    self.push_tokens.renew(&token);
+                }
+            }
+            "push.unregister.request" => {
+                if let Some(token) = s(&msg, "token") {
+                    self.push_tokens.revoke(&token);
+                }
+                reply(out, json!({ "type": "push.unregister.response", "payload": { "requestId": rid } }));
+            }
+            "abort_request" => {}
             "ping" => {
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
                 let mut payload = json!({ "requestId": rid, "serverReceivedAt": now, "serverSentAt": now });
@@ -422,7 +436,7 @@ impl Manager {
                 reply(out, json!({ "type": "pong", "payload": payload }));
             }
             _ => {
-                if request_id.is_some() {
+                if !self.handle_ext_rpc(&kind, &msg, &rid, out) && request_id.is_some() {
                     rpc_error(out, &rid, &kind, "not supported by paseo-lite");
                 }
             }
@@ -435,7 +449,7 @@ impl Manager {
 
     /// Fetch the Codex model list in the background and push it to every session.
     fn push_codex_models(&self) {
-        if !binary_available(&self.cfg.codex_bin) {
+        if !binary_available(&self.cfg.codex_bin) || !self.codex_may_start() {
             return;
         }
         let codex = self.codex.clone();
@@ -496,6 +510,7 @@ impl Manager {
             next_seq: 0,
             attention_reason: None,
             attention_at: None,
+            thinking_option_id: s(&config, "thinkingOptionId").filter(|t| !t.is_empty() && t != "default"),
         };
         let id = rec.id.clone();
         let mut agent = Agent::new(rec);

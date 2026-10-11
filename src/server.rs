@@ -23,7 +23,8 @@ pub async fn serve(ctx: Arc<Ctx>, listen: String, hostnames: Vec<String>) -> std
     let state = AppState { ctx, hostnames: Arc::new(hostnames) };
     let app = Router::new().route("/", get(index)).route("/ws", get(ws_upgrade)).with_state(state);
     crate::log!("listening on http://{listen} (web UI) and ws://{listen}/ws");
-    axum::serve(listener, app).await
+    // Nagle off: agent stream updates are many small frames.
+    axum::serve(listener, app).tcp_nodelay(true).await
 }
 
 async fn index() -> Response {

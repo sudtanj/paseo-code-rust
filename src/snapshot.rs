@@ -6,6 +6,8 @@ use crate::providers::{default_mode, modes_for};
 use crate::store::Row;
 use crate::util::basename;
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 /// Stable opaque workspace id derived from the directory (FNV-1a).
 pub fn workspace_id(cwd: &str) -> String {
@@ -29,13 +31,43 @@ fn project_kind(cwd: &str) -> &'static str {
     if crate::checkout::probe(cwd).is_some() { "git" } else { "directory" }
 }
 
+/// User-chosen project names (`project.rename`), keyed by project root. The
+/// manager owns persistence (`projects.json`); this is the read side for the
+/// free-standing descriptor functions below. (Workspace titles live on the
+/// workspace record.)
+fn project_names() -> std::sync::MutexGuard<'static, HashMap<String, String>> {
+    static NAMES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    NAMES.get_or_init(Default::default).lock().unwrap()
+}
+
+pub fn set_project_name(path: &str, name: Option<&str>) {
+    let mut names = project_names();
+    match name.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(n) => names.insert(path.to_string(), n.to_string()),
+        None => names.remove(path),
+    };
+}
+
+fn project_custom_name(cwd: &str) -> Option<String> {
+    project_names().get(cwd).cloned()
+}
+
 pub fn project_for(cwd: &str) -> Value {
-    json!({ "projectKey": cwd, "projectName": basename(cwd), "workspaceName": basename(cwd), "checkout": checkout(cwd) })
+    let project_name = project_custom_name(cwd).unwrap_or_else(|| basename(cwd));
+    json!({ "projectKey": cwd, "projectName": project_name, "workspaceName": basename(cwd), "checkout": checkout(cwd) })
 }
 
 /// `WorkspaceProjectDescriptorPayload`; ids match `workspace_descriptor`.
 pub fn project_descriptor(cwd: &str) -> Value {
-    json!({ "projectId": cwd, "projectKey": cwd, "projectDisplayName": basename(cwd), "projectRootPath": cwd, "projectKind": project_kind(cwd) })
+    let custom = project_custom_name(cwd);
+    json!({
+        "projectId": cwd,
+        "projectKey": cwd,
+        "projectDisplayName": custom.clone().unwrap_or_else(|| basename(cwd)),
+        "projectCustomName": custom,
+        "projectRootPath": cwd,
+        "projectKind": project_kind(cwd),
+    })
 }
 
 impl Agent {
@@ -54,7 +86,7 @@ impl Agent {
             "cwd": r.cwd,
             "workspaceId": r.workspace_id.clone().unwrap_or_else(|| workspace_id(&r.cwd)),
             "model": r.model,
-            "thinkingOptionId": null,
+            "thinkingOptionId": r.thinking_option_id,
             "createdAt": r.created_at,
             "updatedAt": r.updated_at,
             "lastUserMessageAt": r.last_user_message_at,
@@ -149,10 +181,12 @@ pub fn workspace_descriptor(ws: &crate::store::WorkspaceRecord, agents: &[&Agent
     let activity = agents.iter().map(|a| a.rec.updated_at.clone()).max().unwrap_or_else(|| ws.created_at.clone());
     let probe = crate::checkout::probe(dir);
     let name = ws.title.clone().or_else(|| probe.as_ref().and_then(|(_, b)| b.clone())).unwrap_or_else(|| basename(dir));
+    let custom = project_custom_name(root);
     json!({
         "id": ws.id,
         "projectId": ws.project_id,
-        "projectDisplayName": basename(root),
+        "projectDisplayName": custom.clone().unwrap_or_else(|| basename(root)),
+        "projectCustomName": custom,
         "projectRootPath": root,
         "workspaceDirectory": dir,
         "projectKind": project_kind(root),

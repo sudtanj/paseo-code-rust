@@ -52,6 +52,9 @@ pub struct AgentRecord {
     pub attention_reason: Option<String>,
     #[serde(default)]
     pub attention_at: Option<String>,
+    /// Reasoning effort (`low` … `max`); None = provider default.
+    #[serde(default)]
+    pub thinking_option_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -74,6 +77,13 @@ pub struct Row {
 pub struct ProjectRecord {
     pub root_path: String,
     pub created_at: String,
+    /// Display name override (`project.rename`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_name: Option<String>,
+    /// paseo-lite created this directory (clone / new folder): while it is
+    /// still empty, removing the project deletes it without git checks.
+    #[serde(default)]
+    pub owned: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

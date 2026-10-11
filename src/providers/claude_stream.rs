@@ -19,6 +19,8 @@ pub struct StreamState {
     /// Message ids whose text/thinking already arrived as stream deltas.
     streamed: HashSet<String>,
     current_message: Option<String>,
+    /// Context window occupancy after the latest API call.
+    context_tokens: Option<u64>,
 }
 
 fn s(v: &Value, key: &str) -> Option<String> {
@@ -27,7 +29,7 @@ fn s(v: &Value, key: &str) -> Option<String> {
 
 impl StreamState {
     pub fn new(agent_id: String, events: EventTx, stdin: mpsc::UnboundedSender<String>, interrupted: Arc<AtomicBool>, session_id: Option<String>) -> Self {
-        StreamState { agent_id, events, stdin, interrupted, session_id, tools: HashMap::new(), streamed: HashSet::new(), current_message: None }
+        StreamState { agent_id, events, stdin, interrupted, session_id, tools: HashMap::new(), streamed: HashSet::new(), current_message: None, context_tokens: None }
     }
 
     fn emit(&self, ev: ProviderEvent) {
@@ -42,6 +44,18 @@ impl StreamState {
         let Ok(msg) = serde_json::from_str::<Value>(line) else { return };
         let is_sidechain = msg.get("parent_tool_use_id").map(|v| !v.is_null()).unwrap_or(false);
         match msg.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+            "system" if s(&msg, "subtype").as_deref() == Some("compact_boundary") => {
+                let meta = msg.get("compact_metadata").or_else(|| msg.get("compactMetadata")).unwrap_or(&Value::Null);
+                let pick = |a: &str, b: &str| meta.get(a).or_else(|| meta.get(b)).and_then(|v| v.as_u64());
+                let post = pick("post_tokens", "postTokens");
+                self.context_tokens = post;
+                let trigger = if s(meta, "trigger").as_deref() == Some("manual") { "manual" } else { "auto" };
+                let mut item = json!({ "type": "compaction", "status": "completed", "trigger": trigger });
+                if let Some(pre) = pick("pre_tokens", "preTokens") {
+                    item["preTokens"] = json!(pre);
+                }
+                self.timeline(item);
+            }
             "system" => {
                 if s(&msg, "subtype").as_deref() == Some("init") {
                     if let Some(sid) = s(&msg, "session_id") {
@@ -86,6 +100,15 @@ impl StreamState {
 
     fn handle_assistant(&mut self, msg: &Value) {
         let message = msg.get("message").unwrap_or(&Value::Null);
+        // Each API call reports the full prompt it was sent, so the latest one
+        // is how much of the context window the conversation now occupies.
+        if let Some(u) = message.get("usage") {
+            let n = |k: &str| u.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+            let used = n("input_tokens") + n("cache_creation_input_tokens") + n("cache_read_input_tokens") + n("output_tokens");
+            if used > 0 {
+                self.context_tokens = Some(used);
+            }
+        }
         let streamed = s(message, "id").map(|id| self.streamed.contains(&id)).unwrap_or(false);
         let Some(blocks) = message.get("content").and_then(|c| c.as_array()) else { return };
         for block in blocks {
@@ -147,6 +170,7 @@ impl StreamState {
                 "cachedInputTokens": u.get("cache_read_input_tokens"),
                 "outputTokens": u.get("output_tokens"),
                 "totalCostUsd": msg.get("total_cost_usd"),
+                "contextWindowUsedTokens": self.context_tokens,
             });
             self.emit(ProviderEvent::Usage { agent_id: agent_id.clone(), usage });
         }

@@ -5,8 +5,11 @@
 //! - spawned on the first prompt (with `--resume` when the session exists),
 //! - kept warm for `claude_idle` after a turn so follow-ups are instant,
 //! - then its stdin is closed and it exits, freeing all of its memory.
-//! At most `claude_max_live` children run at once across all projects. When
-//! the cap is hit the oldest idle child is evicted, or the prompt waits.
+//! At most `claude_max_live` children run at once across all projects (one by
+//! default). When the cap is hit the oldest idle child is evicted, or the
+//! prompt waits in a FIFO queue until a running turn finishes.
+//! With `claude_keep_warm` the idle child is never reaped, and the manager
+//! pre-starts one (`prewarm`) so the next prompt skips the cold start.
 
 use super::claude_stream::StreamState;
 use super::{AgentSpec, EventTx, ProviderEvent};
@@ -28,6 +31,8 @@ struct Proc {
     last_used: Instant,
     generation: u64,
     interrupted: Arc<AtomicBool>,
+    /// Spawn flags (model, effort) changed mid-turn: restart once the turn ends.
+    restart: bool,
 }
 
 pub enum SendOutcome {
@@ -51,6 +56,23 @@ impl ClaudePool {
 
     pub fn live_count(&self) -> usize {
         self.procs.len()
+    }
+
+    /// Prompts waiting for a free slot.
+    pub fn waiting_count(&self) -> usize {
+        self.waiting.len()
+    }
+
+    /// Start a process for an agent ahead of its next prompt. Only when the
+    /// pool is completely empty, so it never competes with real work.
+    /// Returns true when a process was started.
+    pub fn prewarm(&mut self, spec: &AgentSpec) -> Result<bool, String> {
+        if !self.procs.is_empty() || !self.waiting.is_empty() || spec.session_id.is_none() {
+            return Ok(false);
+        }
+        self.spawn(spec)?;
+        crate::log!("claude prewarmed for agent {}", spec.id);
+        Ok(true)
     }
 
     fn user_message(text: &str, session_id: &Option<String>) -> String {
@@ -119,10 +141,14 @@ impl ClaudePool {
                 sid
             }
         };
+        if let Some(effort) = spec.thinking.as_deref().filter(|e| !e.is_empty() && *e != "default") {
+            cmd.args(["--effort", effort]);
+        }
         if let Some(prompt) = spec.system_prompt.as_deref().filter(|p| !p.is_empty()) {
             cmd.args(["--append-system-prompt", prompt]);
         }
         cmd.current_dir(&spec.cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+        super::deprioritize(&mut cmd, &self.cfg);
         let mut child = cmd.spawn().map_err(|e| format!("failed to start {}: {e}", self.cfg.claude_bin))?;
         crate::log!("claude started for agent {} (live={})", spec.id, self.procs.len() + 1);
 
@@ -195,15 +221,22 @@ impl ClaudePool {
             let _ = events.send(ProviderEvent::ProcessExited { agent_id, generation });
         });
 
-        self.procs.insert(spec.id.clone(), Proc { stdin: in_tx, kill: Some(kill_tx), busy: false, last_used: Instant::now(), generation, interrupted });
+        self.procs.insert(spec.id.clone(), Proc { stdin: in_tx, kill: Some(kill_tx), busy: false, last_used: Instant::now(), generation, interrupted, restart: false });
         Ok(())
     }
 
     /// Called when a turn finishes. Returns queued prompts that may now start.
     pub fn turn_finished(&mut self, agent_id: &str) -> Vec<(AgentSpec, String)> {
-        if let Some(p) = self.procs.get_mut(agent_id) {
-            p.busy = false;
-            p.last_used = Instant::now();
+        let restart = match self.procs.get_mut(agent_id) {
+            Some(p) => {
+                p.busy = false;
+                p.last_used = Instant::now();
+                p.restart
+            }
+            None => false,
+        };
+        if restart {
+            self.stop(agent_id);
         }
         self.drain_waiting()
     }
@@ -256,7 +289,15 @@ impl ClaudePool {
 
     /// Model changes need a fresh process; the next prompt resumes the session.
     pub fn restart_on_next_prompt(&mut self, agent_id: &str) {
-        if self.procs.get(agent_id).map(|p| !p.busy).unwrap_or(false) {
+        let idle = match self.procs.get_mut(agent_id) {
+            Some(p) if p.busy => {
+                p.restart = true;
+                false
+            }
+            Some(_) => true,
+            None => false,
+        };
+        if idle {
             self.stop(agent_id);
         }
     }
@@ -272,6 +313,9 @@ impl ClaudePool {
 
     /// Reap children idle past the keep-warm window.
     pub fn reap(&mut self) {
+        if self.cfg.claude_keep_warm {
+            return;
+        }
         let idle = self.cfg.claude_idle;
         let stale: Vec<String> = self.procs.iter().filter(|(_, p)| !p.busy && p.last_used.elapsed() >= idle).map(|(id, _)| id.clone()).collect();
         for id in stale {

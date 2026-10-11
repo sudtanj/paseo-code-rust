@@ -5,11 +5,11 @@
 use crate::config::Config;
 use crate::providers::claude::{ClaudePool, SendOutcome};
 use crate::providers::codex::Codex;
-use crate::providers::{AgentSpec, ProviderEvent};
+use crate::providers::{binary_available, AgentSpec, ProviderEvent};
 use crate::store::{AgentRecord, ProjectRecord, Row, Store, WorkspaceRecord};
 use crate::util::{new_id, now_iso};
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -18,12 +18,39 @@ pub type Out = mpsc::UnboundedSender<Arc<str>>;
 
 pub const EPOCH: &str = "e1";
 
+/// Minimum gap between attempts to (re)start a keep-warm process, so a
+/// broken binary or a vanished session can't spin in a restart loop.
+const WARM_RETRY: Duration = Duration::from_secs(60);
+
+/// Prompt text that compacts the conversation (native in Claude Code; mapped
+/// to `thread/compact/start` for Codex).
+const COMPACT_COMMAND: &str = "/compact";
+
+/// The CLI that serves a provider.
+fn cli_of(provider: &str) -> &'static str {
+    if provider == "codex" { "codex" } else { "claude" }
+}
+
+fn cli_label(cli: &str) -> &'static str {
+    if cli == "codex" { "Codex" } else { "Claude Code" }
+}
+
 pub enum Cmd {
     /// A session-level message (already unwrapped from the `session` envelope).
     Rpc { msg: Value, out: Out },
     /// Register a directory produced by background work (GitHub clone), then
     /// send `response` with `payload.project` filled in.
     RegisterProject { path: String, out: Out, response: Value },
+    /// Push tokens Expo reported as dead.
+    RevokePushTokens(Vec<String>),
+}
+
+/// What a connected client last reported via `client_heartbeat`.
+pub struct Presence {
+    pub out: Out,
+    pub focused_agent: Option<String>,
+    pub app_visible: bool,
+    pub active_at: Instant,
 }
 
 pub struct Permission {
@@ -40,6 +67,8 @@ pub struct Agent {
     pub timeline: Option<Vec<Row>>,
     pub dirty_rows: BTreeSet<u64>,
     pub last_touch: Instant,
+    /// The active turn is a daemon-started compaction, not a user prompt.
+    pub compacting: bool,
 }
 
 pub struct Manager {
@@ -49,6 +78,16 @@ pub struct Manager {
     pub agents: HashMap<String, Agent>,
     pub claude: ClaudePool,
     pub codex: Codex,
+    /// The one CLI allowed to have a process ("claude" / "codex"). Switching
+    /// stops the other CLI first, so the two never run side by side.
+    pub active_cli: Option<&'static str>,
+    /// Agents whose turn currently holds a slot on the active CLI.
+    pub running: HashSet<String>,
+    /// Turns (agentId, prompt) waiting for the CLI, across all projects and
+    /// both providers, strictly first come first served.
+    pub cli_queue: VecDeque<(String, String)>,
+    claude_warm_at: Option<Instant>,
+    codex_warm_at: Option<Instant>,
     pub bcast: broadcast::Sender<Arc<str>>,
     pub events_tx: mpsc::UnboundedSender<ProviderEvent>,
     pub agents_dirty: bool,
@@ -62,6 +101,23 @@ pub struct Manager {
     pub cmds_tx: mpsc::UnboundedSender<Cmd>,
     /// Live git diff subscriptions for the Changes panel.
     pub checkout: crate::checkout::Watcher,
+    /// When the daemon started (`daemon.get_status`).
+    pub started_at: String,
+    /// Pending `wait_for_finish_request`s.
+    pub waiters: Vec<Waiter>,
+    /// Expo push tokens registered by phones.
+    pub push_tokens: crate::push::TokenStore,
+    /// Presence per connected client, for in-app vs push notifications.
+    pub clients: Vec<Presence>,
+}
+
+/// A client blocked in `wait_for_finish_request` until the agent stops
+/// running, needs permission, or the deadline passes.
+pub struct Waiter {
+    pub agent_id: String,
+    pub request_id: String,
+    pub out: Out,
+    pub deadline: Option<Instant>,
 }
 
 pub fn wrap(msg: Value) -> Arc<str> {
@@ -88,20 +144,33 @@ impl Manager {
         }
         let projects = store.load_projects();
         let workspaces = store.load_workspaces();
+        let push_tokens = crate::push::TokenStore::load(&cfg.home);
+        for p in &projects {
+            crate::snapshot::set_project_name(&p.root_path, p.custom_name.as_deref());
+        }
         crate::log!("loaded {} agents, {} projects, {} workspaces", agents.len(), projects.len(), workspaces.len());
         let claude = ClaudePool::new(cfg.clone(), events_tx.clone());
         let codex = Codex::new(cfg.clone(), events_tx.clone());
-        let mut manager = Manager { cfg, server_id, store, agents, claude, codex, bcast, events_tx, agents_dirty: false, pairing_url, projects, workspaces, cmds_tx, checkout: crate::checkout::Watcher::start() };
+        let mut manager = Manager { cfg, server_id, store, agents, claude, codex, active_cli: None, running: HashSet::new(), cli_queue: VecDeque::new(), claude_warm_at: None, codex_warm_at: None, bcast, events_tx, agents_dirty: false, pairing_url, projects, workspaces, cmds_tx, checkout: crate::checkout::Watcher::start(), started_at: now_iso(), waiters: Vec::new(), push_tokens, clients: Vec::new() };
         manager.migrate_agent_workspaces();
         (manager, events_rx)
     }
 
-    /// Add a directory to the project registry (idempotent) and return its descriptor.
-    pub fn register_project(&mut self, path: &str) -> Value {
-        if !self.projects.iter().any(|p| p.root_path == path) {
-            self.projects.push(ProjectRecord { root_path: path.to_string(), created_at: now_iso() });
-            self.store.save_projects(&self.projects);
-            crate::log!("project added: {path}");
+    /// Add a directory to the project registry (idempotent) and return its
+    /// descriptor. `owned`: paseo-lite created the directory itself.
+    pub fn register_project(&mut self, path: &str, owned: bool) -> Value {
+        match self.projects.iter_mut().find(|p| p.root_path == path) {
+            Some(p) => {
+                if owned && !p.owned {
+                    p.owned = true;
+                    self.store.save_projects(&self.projects);
+                }
+            }
+            None => {
+                self.projects.push(ProjectRecord { root_path: path.to_string(), created_at: now_iso(), custom_name: None, owned });
+                self.store.save_projects(&self.projects);
+                crate::log!("project added: {path}");
+            }
         }
         let project = crate::snapshot::project_descriptor(path);
         self.broadcast(json!({ "type": "project.update", "payload": { "kind": "upsert", "project": project } }));
@@ -116,14 +185,20 @@ impl Manager {
                 Some(cmd) = cmds.recv() => match cmd {
                     Cmd::Rpc { msg, out } => self.handle_rpc(msg, &out),
                     Cmd::RegisterProject { path, out, mut response } => {
-                        response["payload"]["project"] = self.register_project(&path);
+                        response["payload"]["project"] = self.register_project(&path, true);
                         reply(&out, response);
+                    }
+                    Cmd::RevokePushTokens(tokens) => {
+                        for t in tokens {
+                            self.push_tokens.revoke(&t);
+                        }
                     }
                 },
                 Some(ev) = events.recv() => self.handle_event(ev),
                 _ = tick.tick() => self.housekeeping(),
                 _ = &mut shutdown => break,
             }
+            self.resolve_waiters();
         }
         self.flush_all();
         self.claude.shutdown();
@@ -133,12 +208,74 @@ impl Manager {
     fn housekeeping(&mut self) {
         self.claude.reap();
         self.codex.reap();
+        self.keep_warm();
         self.flush_all();
         let unload = self.cfg.timeline_unload;
         for agent in self.agents.values_mut() {
             if agent.timeline.is_some() && agent.status != "running" && agent.dirty_rows.is_empty() && agent.last_touch.elapsed() >= unload {
                 agent.timeline = None;
             }
+        }
+    }
+
+    /// Keep the active CLI ready so prompts skip the cold start. Only the
+    /// active CLI is ever warmed; the other one stays fully stopped.
+    /// Runs every tick; the first tick fires right after startup.
+    fn keep_warm(&mut self) {
+        if self.active_cli.is_none() {
+            // Startup: the CLI of the most recently used agent becomes active.
+            self.active_cli = self
+                .agents
+                .values()
+                .filter(|a| a.rec.archived_at.is_none() && a.rec.last_user_message_at.is_some())
+                .max_by(|a, b| a.rec.last_user_message_at.cmp(&b.rec.last_user_message_at))
+                .map(|a| cli_of(&a.rec.provider));
+            if let Some(cli) = self.active_cli {
+                crate::log!("active CLI: {cli} (last used)");
+                if cli == "claude" {
+                    self.codex.set_allowed(false);
+                    self.codex.shutdown();
+                }
+            }
+        }
+        if self.active_cli.is_none() && self.codex.is_running() {
+            // Started for model listing before any agent ran: it is the warm
+            // CLI now, so a later Claude turn switches (and stops it) properly.
+            self.active_cli = Some("codex");
+        }
+        let due = |t: Option<Instant>| t.map(|t| t.elapsed() >= WARM_RETRY).unwrap_or(true);
+        match self.active_cli {
+            Some("codex") => {
+                if self.cfg.codex_keep_warm && !self.codex.is_running() && due(self.codex_warm_at) && binary_available(&self.cfg.codex_bin) {
+                    self.codex_warm_at = Some(Instant::now());
+                    let codex = self.codex.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = codex.warm_up().await {
+                            crate::warn!("codex warm-up failed: {e}");
+                        }
+                    });
+                }
+            }
+            Some("claude") => {
+                if self.cfg.claude_keep_warm && self.claude.live_count() == 0 && !self.codex.is_running() && self.running.is_empty() && self.cli_queue.is_empty() && due(self.claude_warm_at) && binary_available(&self.cfg.claude_bin) {
+                    // The process is tied to one session and cwd, so warm the Claude
+                    // agent most likely to get the next prompt: the last one used.
+                    let candidate = self
+                        .agents
+                        .values()
+                        .filter(|a| a.rec.provider == "claude" && a.status != "running" && a.rec.archived_at.is_none() && a.rec.session_id.is_some())
+                        .filter(|a| std::path::Path::new(&a.rec.cwd).is_dir())
+                        .max_by(|a, b| a.rec.last_user_message_at.as_ref().unwrap_or(&a.rec.updated_at).cmp(b.rec.last_user_message_at.as_ref().unwrap_or(&b.rec.updated_at)))
+                        .map(|a| a.rec.id.clone());
+                    if let Some(spec) = candidate.and_then(|id| self.spec(&id)) {
+                        self.claude_warm_at = Some(Instant::now());
+                        if let Err(e) = self.claude.prewarm(&spec) {
+                            crate::warn!("claude prewarm failed: {e}");
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -266,6 +403,7 @@ impl Manager {
                 (Some(d), None) => Some(d.to_string()),
                 (None, own) => own.map(String::from),
             },
+            thinking: a.rec.thinking_option_id.clone(),
         })
     }
 
@@ -309,37 +447,149 @@ impl Manager {
         self.dispatch(agent_id, text);
     }
 
+    /// Queue a turn for the shared CLI and start whatever can run now.
     fn dispatch(&mut self, agent_id: &str, text: String) {
-        let Some(spec) = self.spec(agent_id) else { return };
-        let provider = self.agents[agent_id].rec.provider.clone();
-        if provider == "codex" {
-            let codex = self.codex.clone();
-            let events = self.events_tx.clone();
-            let id = agent_id.to_string();
-            tokio::spawn(async move {
-                if let Err(error) = codex.run_turn(spec, text).await {
-                    let _ = events.send(ProviderEvent::TurnFailed { agent_id: id, error });
+        self.cli_queue.push_back((agent_id.to_string(), text));
+        self.pump();
+        if let Some(pos) = self.cli_queue.iter().position(|(id, _)| id == agent_id) {
+            let note = json!({ "type": "notification", "level": "info", "message": format!("Queued: waiting for the agent CLI ({} ahead)", self.running.len() + pos) });
+            self.append_item(agent_id, note);
+        }
+    }
+
+    /// Start queued turns in strict FIFO order. Only one CLI is active at a
+    /// time: a turn for the other CLI waits until the active CLI's running
+    /// turns end, then the active CLI is shut down and the other one cold
+    /// starts and stays warm until the next switch.
+    fn pump(&mut self) {
+        while let Some((front, _)) = self.cli_queue.front() {
+            let id = front.clone();
+            let Some(provider) = self.agents.get(&id).filter(|a| a.status == "running").map(|a| a.rec.provider.clone()) else {
+                self.cli_queue.pop_front();
+                continue;
+            };
+            let cli = cli_of(&provider);
+            if self.active_cli != Some(cli) {
+                if !self.running.is_empty() {
+                    break;
                 }
-            });
-            return;
-        }
-        match self.claude.send(spec, text) {
-            SendOutcome::Started => {}
-            SendOutcome::Queued => {
-                let note = json!({ "type": "notification", "level": "info", "message": format!("Waiting for a free Claude slot ({} running)", self.claude.live_count()) });
-                self.append_item(agent_id, note);
+                self.switch_cli(cli, &id);
             }
-            SendOutcome::Failed(error) => self.finish_turn(agent_id, Err(error)),
+            let cap = if cli == "codex" { self.cfg.codex_max_active } else { self.cfg.claude_max_live };
+            if self.running.len() >= cap {
+                break;
+            }
+            let Some((id, text)) = self.cli_queue.pop_front() else { break };
+            let Some(spec) = self.spec(&id) else { continue };
+            self.running.insert(id.clone());
+            if cli == "codex" {
+                self.run_codex(spec, text);
+            } else if let SendOutcome::Failed(error) = self.claude.send(spec, text) {
+                self.finish_turn(&id, Err(error));
+            }
         }
+    }
+
+    /// Whether side work (model listing) may start the Codex app-server:
+    /// never while Claude Code is the active CLI.
+    pub fn codex_may_start(&self) -> bool {
+        self.active_cli != Some("claude")
+    }
+
+    /// Stop the active CLI's processes and hand the machine to `cli`.
+    fn switch_cli(&mut self, cli: &'static str, for_agent: &str) {
+        // Always stop the other CLI, even with no active one recorded yet.
+        if cli == "codex" {
+            self.claude.shutdown();
+            self.codex.set_allowed(true);
+        } else {
+            // Block first so an in-flight warm-up can't restart it.
+            self.codex.set_allowed(false);
+            self.codex.shutdown();
+        }
+        if let Some(old) = self.active_cli {
+            crate::log!("switching CLI: {old} -> {cli}");
+            let note = json!({ "type": "notification", "level": "info", "message": format!("Switching from {} to {} (starting {})", cli_label(old), cli_label(cli), cli_label(cli)) });
+            self.append_item(for_agent, note);
+        }
+        self.active_cli = Some(cli);
+        self.claude_warm_at = None;
+        self.codex_warm_at = None;
+    }
+
+    fn run_codex(&mut self, spec: AgentSpec, text: String) {
+        let codex = self.codex.clone();
+        let events = self.events_tx.clone();
+        let id = spec.id.clone();
+        tokio::spawn(async move {
+            // `/compact` (typed, or queued by auto-compaction) maps to Codex's
+            // native thread compaction; Claude handles the command itself.
+            let result = if text.trim() == COMPACT_COMMAND { codex.compact(spec).await } else { codex.run_turn(spec, text).await };
+            if let Err(error) = result {
+                let _ = events.send(ProviderEvent::TurnFailed { agent_id: id, error });
+            }
+        });
+    }
+
+    /// True when the agent's last turn left its context window at or past
+    /// `auto_compact_pct`.
+    fn needs_compaction(&self, agent_id: &str) -> bool {
+        let pct = self.cfg.auto_compact_pct as u64;
+        let Some(a) = self.agents.get(agent_id) else { return false };
+        if pct == 0 || a.rec.session_id.is_none() {
+            return false;
+        }
+        let Some(usage) = &a.rec.last_usage else { return false };
+        let get = |k: &str| usage.get(k).and_then(|v| v.as_u64()).filter(|n| *n > 0);
+        match (get("contextWindowUsedTokens"), get("contextWindowMaxTokens")) {
+            (Some(used), Some(max)) => used * 100 >= max * pct,
+            _ => false,
+        }
+    }
+
+    /// Run `/compact` as its own turn, ahead of the agent's queued prompts,
+    /// so the next prompt is sent with a summarised (smaller) context.
+    fn start_compaction(&mut self, agent_id: &str) {
+        let provider = {
+            let Some(agent) = self.agents.get_mut(agent_id) else { return };
+            let turn_id = new_id();
+            agent.status = "running";
+            agent.active_turn = Some((turn_id, now_iso()));
+            agent.compacting = true;
+            // Wait for fresh numbers before considering another compaction.
+            if let Some(Value::Object(u)) = agent.rec.last_usage.as_mut() {
+                u.remove("contextWindowUsedTokens");
+            }
+            agent.rec.provider.clone()
+        };
+        crate::log!("auto-compacting context for agent {agent_id}");
+        let turn_id = self.agents[agent_id].active_turn.as_ref().map(|t| t.0.clone());
+        let note = json!({ "type": "notification", "level": "info", "message": format!("Context is over {}% full; compacting to save tokens", self.cfg.auto_compact_pct) });
+        self.append_item(agent_id, note);
+        self.stream(agent_id, &provider, json!({ "type": "turn_started", "provider": provider, "turnId": turn_id }));
+        self.touch(agent_id);
+        self.publish_agent(agent_id);
+        self.dispatch(agent_id, COMPACT_COMMAND.to_string());
     }
 
     /// End the active turn. `Ok(None)` completed, `Ok(Some(reason))` canceled, `Err` failed.
     pub fn finish_turn(&mut self, agent_id: &str, outcome: Result<Option<String>, String>) {
+        let compacting = match self.agents.get_mut(agent_id) {
+            Some(a) if a.status == "running" => std::mem::take(&mut a.compacting),
+            _ => return,
+        };
+        // A failed auto-compaction is not the user's failure: note it and
+        // carry on with the uncompacted context (the CLI's own limit still applies).
+        let outcome = match outcome {
+            Err(e) if compacting => {
+                crate::warn!("auto-compaction failed for agent {agent_id}: {e}");
+                self.append_item(agent_id, json!({ "type": "notification", "level": "warning", "message": format!("Auto-compaction failed: {e}") }));
+                Ok(None)
+            }
+            other => other,
+        };
         let (provider, turn_id) = {
             let Some(agent) = self.agents.get_mut(agent_id) else { return };
-            if agent.status != "running" {
-                return;
-            }
             let turn_id = agent.active_turn.take().map(|t| t.0);
             // Dropping the reply senders makes providers deny outstanding requests.
             let pending: Vec<String> = agent.permissions.drain(..).filter_map(|p| p.request.get("id").and_then(|i| i.as_str()).map(String::from)).collect();
@@ -349,8 +599,11 @@ impl Manager {
                 Err(_) => Some("error"),
                 Ok(Some(_)) => None,
             };
-            agent.rec.attention_reason = reason.map(String::from);
-            agent.rec.attention_at = reason.map(|_| now_iso());
+            // The user's turn already raised its attention; the compaction after it doesn't.
+            if !compacting {
+                agent.rec.attention_reason = reason.map(String::from);
+                agent.rec.attention_at = reason.map(|_| now_iso());
+            }
             if let Err(e) = &outcome {
                 agent.rec.last_error = Some(e.clone());
             }
@@ -381,7 +634,17 @@ impl Manager {
         self.touch(agent_id);
         self.publish_agent(agent_id);
         self.checkout.poke();
+        if !compacting {
+            match &outcome {
+                Ok(None) => self.notify_attention(agent_id, "finished"),
+                Err(_) => self.notify_attention(agent_id, "error"),
+                Ok(Some(_)) => {}
+            }
+        }
 
+        // Free the CLI slot (or the queue entry of a turn that never started).
+        self.running.remove(agent_id);
+        self.cli_queue.retain(|(id, _)| id != agent_id);
         if provider == "claude" {
             for (spec, text) in self.claude.turn_finished(agent_id) {
                 let id = spec.id.clone();
@@ -389,6 +652,12 @@ impl Manager {
                     self.finish_turn(&id, Err(e));
                 }
             }
+        }
+        self.pump();
+        if !compacting && matches!(outcome, Ok(None)) && self.needs_compaction(agent_id) {
+            // Queued prompts for this agent run after the compaction finishes.
+            self.start_compaction(agent_id);
+            return;
         }
         let next = self.agents.get_mut(agent_id).and_then(|a| a.queue.pop_front());
         if let Some(text) = next {
@@ -402,7 +671,12 @@ impl Manager {
         if agent.status != "running" {
             return;
         }
-        if agent.rec.provider == "codex" {
+        let is_codex = agent.rec.provider == "codex";
+        if self.cli_queue.iter().any(|(id, _)| id == agent_id) {
+            self.finish_turn(agent_id, Ok(Some("canceled before start".into())));
+            return;
+        }
+        if is_codex {
             let codex = self.codex.clone();
             let id = agent_id.to_string();
             tokio::spawn(async move { codex.interrupt(&id).await });
@@ -437,9 +711,18 @@ impl Manager {
                 self.broadcast(json!({ "type": "agent_permission_request", "payload": { "agentId": agent_id, "request": request } }));
                 self.stream(&agent_id, &provider, json!({ "type": "permission_requested", "provider": provider, "request": request }));
                 self.publish_agent(&agent_id);
+                self.notify_attention(&agent_id, "permission");
             }
             ProviderEvent::Usage { agent_id, usage } => {
                 if let Some(a) = self.agents.get_mut(&agent_id) {
+                    let mut usage = usage;
+                    // Claude doesn't report its window size; derive it from the model.
+                    if a.rec.provider == "claude" && usage.get("contextWindowMaxTokens").map(|v| v.is_null()).unwrap_or(true) {
+                        // From the model catalog; unknown or default model -> the configured window.
+                        let model = a.rec.model.as_deref().unwrap_or("");
+                        let window = crate::providers::claude_context_window(model).unwrap_or(if model.to_ascii_lowercase().contains("[1m]") { 1_000_000 } else { self.cfg.claude_context_window });
+                        usage["contextWindowMaxTokens"] = json!(window);
+                    }
                     a.rec.last_usage = Some(usage);
                 }
             }
@@ -448,16 +731,90 @@ impl Manager {
             ProviderEvent::TurnFailed { agent_id, error } => self.finish_turn(&agent_id, Err(error)),
             ProviderEvent::ProcessExited { agent_id, generation } => {
                 let (current, ready) = self.claude.process_exited(&agent_id, generation);
-                if current && self.agents.get(&agent_id).map(|a| a.status == "running").unwrap_or(false) && !self.claude.is_waiting(&agent_id) {
-                    self.finish_turn(&agent_id, Err("claude exited unexpectedly".into()));
-                }
+                let queued = self.claude.is_waiting(&agent_id) || self.cli_queue.iter().any(|(id, _)| id == &agent_id);
+                let failed = current && self.agents.get(&agent_id).map(|a| a.status == "running").unwrap_or(false) && !queued;
+                // Start the prompts that were waiting on this slot before
+                // finish_turn drains the pool again, so they keep their order.
                 for (spec, text) in ready {
                     let id = spec.id.clone();
                     if let SendOutcome::Failed(e) = self.claude.send(spec, text) {
                         self.finish_turn(&id, Err(e));
                     }
                 }
+                if failed {
+                    self.finish_turn(&agent_id, Err("claude exited unexpectedly".into()));
+                }
             }
+        }
+    }
+
+    /// Record a `client_heartbeat` (focus, visibility, last activity).
+    pub fn client_heartbeat(&mut self, msg: &Value, out: &Out) {
+        self.clients.retain(|c| !c.out.is_closed());
+        // Age of the client's last activity, from its own timestamp; never in the future.
+        let age = msg
+            .get("lastActivityAt")
+            .and_then(|v| v.as_str())
+            .and_then(|t| humantime::parse_rfc3339_weak(t).ok())
+            .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+            .unwrap_or_default();
+        let presence = Presence {
+            out: out.clone(),
+            focused_agent: msg.get("focusedAgentId").and_then(|v| v.as_str()).map(String::from),
+            app_visible: msg.get("appVisible").and_then(|v| v.as_bool()).unwrap_or(false),
+            active_at: Instant::now().checked_sub(age).unwrap_or_else(Instant::now),
+        };
+        match self.clients.iter_mut().find(|c| c.out.same_channel(out)) {
+            Some(c) => *c = presence,
+            None => self.clients.push(presence),
+        }
+    }
+
+    /// Tell the user an agent needs them, like upstream: nothing if a present
+    /// client is looking at that agent; an in-app notice to the most recently
+    /// active present client; otherwise a phone push (not for errors).
+    pub fn notify_attention(&mut self, agent_id: &str, reason: &'static str) {
+        self.clients.retain(|c| !c.out.is_closed());
+        // A backgrounded app (phone locked) is not present: it should get a push.
+        let present: Vec<&Presence> = self.clients.iter().filter(|c| c.app_visible && c.active_at.elapsed() <= crate::push::PRESENCE_WINDOW).collect();
+        if present.iter().any(|c| c.app_visible && c.focused_agent.as_deref() == Some(agent_id)) {
+            return;
+        }
+        let recipient = present.iter().max_by_key(|c| c.active_at).map(|c| c.out.clone());
+        // The workspace the app groups this agent under (same id as in its snapshot).
+        let Some(workspace) = self.agents.get(agent_id).map(|a| a.rec.workspace_id.clone().unwrap_or_else(|| crate::snapshot::workspace_id(&a.rec.cwd))) else { return };
+        let detail = match reason {
+            "finished" => self.last_assistant_message(agent_id),
+            "permission" => self.agents.get(agent_id).and_then(|a| a.permissions.last()).map(|p| {
+                let title = p.request.get("title").and_then(|t| t.as_str()).unwrap_or("").trim().to_string();
+                let desc = p.request.get("description").and_then(|t| t.as_str()).unwrap_or("").trim().to_string();
+                match (title.is_empty(), desc.is_empty() || desc == title) {
+                    (false, false) => format!("{title} - {desc}"),
+                    (false, true) => title,
+                    (true, false) => desc,
+                    (true, true) => p.request.get("name").and_then(|n| n.as_str()).unwrap_or("tool").to_string(),
+                }
+            }),
+            _ => None,
+        };
+        let payload = crate::push::attention_payload(reason, &self.server_id, &workspace, agent_id, detail.as_deref());
+        match recipient {
+            Some(out) => reply(&out, json!({ "type": "agent_attention_required", "payload": { "agentId": agent_id, "reason": reason, "timestamp": now_iso(), "shouldNotify": true, "notification": payload } })),
+            None if reason != "error" => {
+                let tokens = self.push_tokens.active();
+                if tokens.is_empty() {
+                    return;
+                }
+                crate::log!("push notification ({reason}) for agent {agent_id} to {} device(s)", tokens.len());
+                let cmds = self.cmds_tx.clone();
+                tokio::spawn(async move {
+                    let dead = crate::push::send(tokens, payload).await;
+                    if !dead.is_empty() {
+                        let _ = cmds.send(Cmd::RevokePushTokens(dead));
+                    }
+                });
+            }
+            None => {}
         }
     }
 
@@ -485,15 +842,22 @@ impl Manager {
             a.permissions.clear();
             a.status = "idle";
             a.active_turn = None;
+            a.compacting = false;
         }
         self.claude.stop(agent_id);
-        self.codex.forget(agent_id);
+        self.cli_queue.retain(|(id, _)| id != agent_id);
+        // Interrupt the turn in the shared app-server too, so the freed slot
+        // doesn't overlap with an orphaned turn.
+        self.codex.abandon(agent_id);
+        if self.running.remove(agent_id) {
+            self.pump();
+        }
     }
 }
 
 impl Agent {
     pub fn new(rec: AgentRecord) -> Agent {
-        Agent { rec, status: "idle", active_turn: None, queue: VecDeque::new(), permissions: Vec::new(), timeline: None, dirty_rows: BTreeSet::new(), last_touch: Instant::now() }
+        Agent { rec, status: "idle", active_turn: None, queue: VecDeque::new(), permissions: Vec::new(), timeline: None, dirty_rows: BTreeSet::new(), last_touch: Instant::now(), compacting: false }
     }
 
     pub fn ensure_timeline(&mut self, store: &Store) {

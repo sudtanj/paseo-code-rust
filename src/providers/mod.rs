@@ -20,6 +20,8 @@ pub struct AgentSpec {
     pub mode_id: Option<String>,
     pub session_id: Option<String>,
     pub system_prompt: Option<String>,
+    /// Reasoning effort; None = provider default.
+    pub thinking: Option<String>,
 }
 
 pub enum ProviderEvent {
@@ -62,6 +64,17 @@ pub fn modes_for(provider: &str) -> Value {
     if provider == "codex" { codex_modes() } else { claude_modes() }
 }
 
+/// Reasoning-effort levels passed to `claude --effort`.
+pub fn claude_thinking_options() -> Value {
+    serde_json::json!([
+        { "id": "low", "label": "Low" },
+        { "id": "medium", "label": "Medium" },
+        { "id": "high", "label": "High" },
+        { "id": "xhigh", "label": "Extra high" },
+        { "id": "max", "label": "Max" }
+    ])
+}
+
 /// Claude Code model catalog, ported from upstream's curated manifest
 /// (providers/claude/model-manifest.ts). Upstream verifies it with a probe
 /// process; paseo-lite skips the probe to avoid spawning `claude` just to
@@ -87,6 +100,7 @@ pub fn claude_models() -> Value {
         ("claude-haiku-5-5", "Haiku 5.5", "Haiku 5.5 · Fastest for quick answers", 1_000_000),
         ("claude-haiku-4-5", "Haiku 4.5", "Haiku 4.5 · Previous release", 200_000),
     ];
+    let thinking = claude_thinking_options();
     Value::Array(
         MODELS
             .iter()
@@ -95,14 +109,64 @@ pub fn claude_models() -> Value {
                 if *id == "claude-opus-5-5" {
                     m["isDefault"] = serde_json::json!(true);
                 }
+                // Haiku models are offered without effort levels.
+                if !id.contains("haiku") {
+                    m["thinkingOptions"] = thinking.clone();
+                }
                 m
             })
             .collect(),
     )
 }
 
+/// Context window of a catalog model (None for unknown ids / the default).
+pub fn claude_context_window(model: &str) -> Option<u64> {
+    claude_models().as_array()?.iter().find(|m| m["id"].as_str() == Some(model)).and_then(|m| m["contextWindowMaxTokens"].as_u64())
+}
+
 pub fn is_supported(provider: &str) -> bool {
     provider == "claude" || provider == "codex"
+}
+
+/// Run an agent CLI below the daemon: lower CPU and I/O priority and a higher
+/// OOM score. Children (tool commands, builds, test runs) inherit all three,
+/// so a heavy agent task slows itself down instead of starving the daemon.
+pub fn deprioritize(cmd: &mut tokio::process::Command, cfg: &crate::config::Config) {
+    #[cfg(unix)]
+    {
+        let nice = cfg.agent_nice;
+        let low_io = cfg.agent_low_io;
+        let oom = (cfg.agent_oom_score_adj > 0).then(|| cfg.agent_oom_score_adj.to_string().into_bytes());
+        // SAFETY: the closure runs between fork and exec, so it only makes
+        // async-signal-safe libc calls and never allocates (`oom` is built
+        // beforehand). Failures are ignored: priority is best effort.
+        unsafe {
+            cmd.pre_exec(move || {
+                if nice > 0 {
+                    libc::setpriority(libc::PRIO_PROCESS, 0, nice);
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    if low_io {
+                        // IOPRIO_WHO_PROCESS, self, best-effort class (2) at level 7 (lowest).
+                        libc::syscall(libc::SYS_ioprio_set, 1, 0, (2 << 13) | 7);
+                    }
+                    if let Some(value) = &oom {
+                        let fd = libc::open(c"/proc/self/oom_score_adj".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+                        if fd >= 0 {
+                            libc::write(fd, value.as_ptr().cast(), value.len());
+                            libc::close(fd);
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                let _ = (low_io, &oom);
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (cmd, cfg);
 }
 
 /// Locate an executable on PATH without spawning anything.
