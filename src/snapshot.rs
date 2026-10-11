@@ -134,16 +134,20 @@ pub fn strip_nulls(v: Value) -> Value {
 }
 
 /// Recursively drop `null` members (Zod `.optional()` rejects null), except
-/// members whose schema requires an explicit null.
+/// members whose schema requires an explicit null: a tool call's `error`, and
+/// `input`/`output` of an `unknown` tool detail. Elsewhere (e.g. a shell
+/// detail's `output`) a null fails validation of the whole response.
 pub fn clean(v: Value) -> Value {
-    const KEEP_NULL: [&str; 3] = ["error", "input", "output"];
     match v {
-        Value::Object(map) => Value::Object(
-            map.into_iter()
-                .filter(|(k, v)| !v.is_null() || KEEP_NULL.contains(&k.as_str()))
-                .map(|(k, v)| (k, clean(v)))
-                .collect(),
-        ),
+        Value::Object(map) => {
+            let unknown_detail = map.get("type").and_then(|t| t.as_str()) == Some("unknown");
+            Value::Object(
+                map.into_iter()
+                    .filter(|(k, v)| !v.is_null() || k == "error" || (unknown_detail && (k == "input" || k == "output")))
+                    .map(|(k, v)| (k, clean(v)))
+                    .collect(),
+            )
+        }
         Value::Array(items) => Value::Array(items.into_iter().map(clean).collect()),
         other => other,
     }
@@ -153,7 +157,8 @@ pub fn timeline_entry(provider: &str, row: &Row) -> Value {
     let ranges: Vec<Value> = row.ranges.iter().map(|(a, b)| json!({ "startSeq": a, "endSeq": b })).collect();
     let mut entry = json!({
         "provider": provider,
-        "item": row.item,
+        // Rows saved by older versions may hold nulls the app rejects.
+        "item": clean(row.item.clone()),
         "timestamp": row.timestamp,
         "seqStart": row.seq_start,
         "seqEnd": row.seq_end,
