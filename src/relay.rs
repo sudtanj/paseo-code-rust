@@ -7,7 +7,7 @@
 
 use crate::config::Config;
 use crate::e2ee::{Channel, DaemonIdentity};
-use crate::session::{self, Ctx};
+use crate::session::{self, Ctx, Inbound};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -226,7 +226,7 @@ async fn data_socket(ctx: Arc<Ctx>, cfg: &Config, identity: Arc<DaemonIdentity>,
     .map_err(|_| "handshake timeout".to_string())??;
     sink.send(ready_frame(binary_ciphertext)).await.map_err(|e| e.to_string())?;
 
-    let (in_tx, in_rx) = tokio::sync::mpsc::channel::<String>(64);
+    let (in_tx, in_rx) = tokio::sync::mpsc::channel::<Inbound>(64);
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Arc<str>>(256);
     let session = tokio::spawn(session::run(ctx, in_rx, out_tx, true));
     let mut last_seen = Instant::now();
@@ -286,15 +286,15 @@ async fn data_socket(ctx: Arc<Ctx>, cfg: &Config, identity: Arc<DaemonIdentity>,
                         if text.trim_start().starts_with('{') {
                             break Err("plaintext frame on encrypted channel".into());
                         }
-                        channel.decrypt_text(&text)
+                        channel.decrypt_text_bytes(&text).and_then(inbound_frame)
                     }
-                    Message::Binary(bytes) => channel.decrypt(&bytes).and_then(|p| String::from_utf8(p).map_err(|e| e.to_string())),
+                    Message::Binary(bytes) => channel.decrypt(&bytes).and_then(inbound_frame),
                     Message::Close(_) => break Ok(()),
                     _ => continue,
                 };
                 match plaintext {
-                    Ok(text) => {
-                        if in_tx.send(text).await.is_err() {
+                    Ok(frame) => {
+                        if in_tx.send(frame).await.is_err() {
                             break Ok(());
                         }
                     }
@@ -308,4 +308,14 @@ async fn data_socket(ctx: Arc<Ctx>, cfg: &Config, identity: Arc<DaemonIdentity>,
     };
     session.abort();
     result
+}
+
+/// Decrypted plaintext -> session frame: file-transfer frames stay binary,
+/// everything else must be UTF-8 JSON.
+fn inbound_frame(plain: Vec<u8>) -> Result<Inbound, String> {
+    if crate::uploads::is_file_frame(&plain) {
+        Ok(Inbound::Binary(plain))
+    } else {
+        String::from_utf8(plain).map(Inbound::Text).map_err(|e| e.to_string())
+    }
 }

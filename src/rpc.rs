@@ -75,7 +75,8 @@ impl Manager {
             }
             "create_agent_request" => self.create_agent(&msg, &rid, out),
             "send_agent_message_request" | "send_agent_message" => {
-                let text = s(&msg, "text").unwrap_or_default();
+                // Images and attachments are saved and described in the prompt (see uploads.rs).
+                let text = crate::uploads::build_prompt(&self.cfg.home, &s(&msg, "text").unwrap_or_default(), msg.get("images"), msg.get("attachments"));
                 let result = match self.resolve(&agent_key) {
                     Some(id) if !text.trim().is_empty() => self.submit_prompt(&id, text, s(&msg, "messageId")).map(|_| id),
                     Some(_) => Err("empty message".into()),
@@ -530,7 +531,8 @@ impl Manager {
         let snapshot = self.agents[&id].snapshot();
         reply(out, json!({ "type": "status", "payload": { "status": "agent_created", "agentId": id, "requestId": rid, "agent": snapshot } }));
         self.publish_agent(&id);
-        if let Some(prompt) = s(msg, "initialPrompt").filter(|p| !p.trim().is_empty()) {
+        let initial = crate::uploads::build_prompt(&self.cfg.home, &s(msg, "initialPrompt").unwrap_or_default(), msg.get("images"), msg.get("attachments"));
+        if let Some(prompt) = Some(initial).filter(|p| !p.trim().is_empty()) {
             let _ = self.submit_prompt(&id, prompt, s(msg, "clientMessageId"));
         }
     }

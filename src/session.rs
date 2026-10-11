@@ -8,12 +8,20 @@ use tokio::sync::{broadcast, mpsc};
 
 pub const WS_PROTOCOL_VERSION: i64 = 1;
 
+/// A frame from the client: JSON text, or binary (file-transfer frames).
+pub enum Inbound {
+    Text(String),
+    Binary(Vec<u8>),
+}
+
 pub struct Ctx {
     pub cmds: mpsc::UnboundedSender<Cmd>,
     pub bcast: broadcast::Sender<Arc<str>>,
     pub server_id: String,
     pub hostname: String,
     pub password: Option<String>,
+    /// paseo-lite home: uploads are stored under `uploads/`.
+    pub home: std::path::PathBuf,
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -61,11 +69,12 @@ fn server_info(ctx: &Ctx) -> Arc<str> {
 }
 
 /// Returns when the client goes away or is rejected.
-pub async fn run(ctx: Arc<Ctx>, mut inbound: mpsc::Receiver<String>, outbound: mpsc::Sender<Arc<str>>, via_relay: bool) {
+pub async fn run(ctx: Arc<Ctx>, mut inbound: mpsc::Receiver<Inbound>, outbound: mpsc::Sender<Arc<str>>, via_relay: bool) {
     // Phase 1: wait for hello. Relay sockets are already authenticated by the
     // E2EE key exchange (same policy as the Node daemon).
     loop {
-        let Some(text) = inbound.recv().await else { return };
+        let Some(frame) = inbound.recv().await else { return };
+        let Inbound::Text(text) = frame else { continue };
         let Ok(msg) = serde_json::from_str::<Value>(&text) else { continue };
         match msg.get("type").and_then(|t| t.as_str()) {
             Some("ping") => {
@@ -103,10 +112,21 @@ pub async fn run(ctx: Arc<Ctx>, mut inbound: mpsc::Receiver<String>, outbound: m
     // Phase 2: live session.
     let mut events = ctx.bcast.subscribe();
     let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<Arc<str>>();
+    let mut uploads = crate::uploads::Uploads::default();
     loop {
         tokio::select! {
             frame = inbound.recv() => {
-                let Some(text) = frame else { return };
+                let text = match frame {
+                    None => return,
+                    Some(Inbound::Text(text)) => text,
+                    // File-transfer frames of an upload this session started.
+                    Some(Inbound::Binary(bytes)) => {
+                        if let Some(resp) = uploads.frame(&bytes).await {
+                            if outbound.send(crate::manager::wrap(resp)).await.is_err() { return; }
+                        }
+                        continue;
+                    }
+                };
                 let Ok(mut msg) = serde_json::from_str::<Value>(&text) else { continue };
                 match msg.get("type").and_then(|t| t.as_str()) {
                     Some("ping") => {
@@ -117,6 +137,13 @@ pub async fn run(ctx: Arc<Ctx>, mut inbound: mpsc::Receiver<String>, outbound: m
                     }
                     Some("session") => {
                         let inner = msg.get_mut("message").map(Value::take).unwrap_or(Value::Null);
+                        // Uploads are per connection (the bytes follow on this socket).
+                        if inner.get("type").and_then(|t| t.as_str()) == Some("file.upload.request") {
+                            if let Some(resp) = uploads.begin(&ctx.home, &inner) {
+                                if outbound.send(crate::manager::wrap(resp)).await.is_err() { return; }
+                            }
+                            continue;
+                        }
                         if ctx.cmds.send(Cmd::Rpc { msg: inner, out: reply_tx.clone() }).is_err() { return; }
                     }
                     _ => {}

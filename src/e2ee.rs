@@ -130,13 +130,17 @@ impl Channel {
     }
 
     pub fn decrypt_text(&self, frame: &str) -> Result<String, String> {
+        String::from_utf8(self.decrypt_text_bytes(frame)?).map_err(|e| e.to_string())
+    }
+
+    /// Plaintext bytes of a text (base64) frame: JSON, or a binary file-transfer frame.
+    pub fn decrypt_text_bytes(&self, frame: &str) -> Result<Vec<u8>, String> {
         // Mirrors base64ToArrayBuffer: accept url-safe alphabet and missing padding.
         let mut s: String = frame.trim().chars().map(|c| match c { '-' => '+', '_' => '/', c => c }).collect();
         while s.len() % 4 != 0 {
             s.push('=');
         }
         let bytes = STANDARD.decode(s.as_bytes()).map_err(|e| e.to_string())?;
-        let plain = self.decrypt(&bytes)?;
-        String::from_utf8(plain).map_err(|e| e.to_string())
+        self.decrypt(&bytes)
     }
 }

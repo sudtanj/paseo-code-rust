@@ -76,9 +76,24 @@ impl ClaudePool {
     }
 
     fn user_message(text: &str, session_id: &Option<String>) -> String {
+        let mut content = vec![json!({ "type": "text", "text": text })];
+        // Attached images go in as image blocks so the model actually sees them.
+        for path in crate::uploads::image_paths(text) {
+            const MAX_INLINE: u64 = 5 * 1024 * 1024; // the API's per-image limit
+            match std::fs::metadata(&path).map(|m| m.len()) {
+                Ok(len) if len <= MAX_INLINE => {
+                    if let Ok(bytes) = std::fs::read(&path) {
+                        use base64::Engine;
+                        let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+                        content.push(json!({ "type": "image", "source": { "type": "base64", "media_type": crate::uploads::mime_for_path(&path), "data": data } }));
+                    }
+                }
+                _ => crate::warn!("image {path} too large to inline; the agent gets its path only"),
+            }
+        }
         json!({
             "type": "user",
-            "message": { "role": "user", "content": [{ "type": "text", "text": text }] },
+            "message": { "role": "user", "content": content },
             "parent_tool_use_id": null,
             "session_id": session_id.clone().unwrap_or_default(),
         })

@@ -62,7 +62,7 @@ async fn ws_upgrade(State(state): State<AppState>, headers: HeaderMap, ws: WebSo
 async fn handle_socket(ctx: Arc<Ctx>, socket: WebSocket) {
     use std::time::{Duration, Instant};
     let (mut sink, mut stream) = socket.split();
-    let (in_tx, in_rx) = tokio::sync::mpsc::channel::<String>(64);
+    let (in_tx, in_rx) = tokio::sync::mpsc::channel::<session::Inbound>(64);
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Arc<str>>(256);
     let session = tokio::spawn(session::run(ctx, in_rx, out_tx, false));
     // Phones drop off the network without closing the socket: ping, and give up
@@ -90,16 +90,18 @@ async fn handle_socket(ctx: Arc<Ctx>, socket: WebSocket) {
             }
             frame = stream.next() => {
                 last_seen = Instant::now();
-                let text = match frame {
-                    Some(Ok(Message::Text(t))) => t,
+                let inbound = match frame {
+                    Some(Ok(Message::Text(t))) => session::Inbound::Text(t),
+                    // File-transfer frames (uploads) stay binary; other binary must be UTF-8 JSON.
+                    Some(Ok(Message::Binary(b))) if crate::uploads::is_file_frame(&b) => session::Inbound::Binary(b),
                     Some(Ok(Message::Binary(b))) => match String::from_utf8(b) {
-                        Ok(t) => t,
+                        Ok(t) => session::Inbound::Text(t),
                         Err(_) => continue,
                     },
                     Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
                     Some(Ok(_)) => continue,
                 };
-                if in_tx.send(text).await.is_err() {
+                if in_tx.send(inbound).await.is_err() {
                     break;
                 }
             }

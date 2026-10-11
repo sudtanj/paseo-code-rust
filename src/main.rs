@@ -16,6 +16,7 @@ mod server;
 mod session;
 mod snapshot;
 mod store;
+mod uploads;
 mod util;
 mod workspaces;
 
@@ -101,9 +102,11 @@ async fn run(cfg: Config, identity: Arc<e2ee::DaemonIdentity>) {
         server_id: identity.server_id.clone(),
         hostname: hostname(),
         password: cfg.password.clone(),
+        home: cfg.home.clone(),
     });
 
     crate::log!("paseo-lite {} serverId={} home={}", env!("CARGO_PKG_VERSION"), identity.server_id, cfg.home.display());
+    uploads::prune(&cfg.home);
     if cfg.relay_enabled {
         print_pairing(&cfg, &identity);
         tokio::spawn(relay::run(ctx.clone(), cfg.clone(), identity.clone()));

@@ -462,7 +462,7 @@ impl Manager {
             agent.rec.last_error = None;
             agent.rec.attention_reason = None;
             if agent.rec.title.is_none() {
-                let first = messages.first().map(|m| m.0.as_str()).unwrap_or("");
+                let first = messages.first().map(|m| crate::uploads::bubble_text(&m.0)).unwrap_or_default();
                 let first_line = first.lines().next().unwrap_or("").trim();
                 agent.rec.title = Some(crate::util::truncate(first_line, 80));
             }
@@ -470,7 +470,8 @@ impl Manager {
         };
         // One bubble per message, exactly as the user sent them.
         for (msg_text, message_id) in &messages {
-            let mut user = json!({ "type": "user_message", "text": msg_text, "messageId": message_id.clone().unwrap_or_else(new_id) });
+            // The bubble shows what the user wrote (plus attachment names), not the notes for the agent.
+            let mut user = json!({ "type": "user_message", "text": crate::uploads::bubble_text(msg_text), "messageId": message_id.clone().unwrap_or_else(new_id) });
             if let Some(id) = message_id {
                 user["clientMessageId"] = json!(id);
             }

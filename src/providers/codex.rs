@@ -248,9 +248,14 @@ impl Codex {
             st.thread_agent.insert(thread_id.clone(), spec.id.clone());
             st.active.insert(spec.id.clone(), (thread_id.clone(), None));
         }
+        // Attached images as local image inputs (the app-server reads the file).
+        let mut input = vec![json!({ "type": "text", "text": text, "text_elements": [] })];
+        for path in crate::uploads::image_paths(&text) {
+            input.push(json!({ "type": "localImage", "path": path }));
+        }
         let mut params = json!({
             "threadId": thread_id,
-            "input": [{ "type": "text", "text": text, "text_elements": [] }],
+            "input": input,
             "cwd": spec.cwd,
             "approvalPolicy": approval,
             "sandboxPolicy": sandbox_policy,

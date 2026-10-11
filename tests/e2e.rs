@@ -469,3 +469,57 @@ async fn catch_up_returns_rows_updated_in_place() {
     assert_eq!(after["hasNewer"], false);
     assert_eq!(after["endCursor"]["seq"], after["window"]["maxSeq"]);
 }
+
+fn file_frame(op: u8, request_id: &str, body: &[u8]) -> Vec<u8> {
+    let mut v = vec![op, request_id.len() as u8];
+    v.extend_from_slice(request_id.as_bytes());
+    v.extend_from_slice(body);
+    v
+}
+
+/// The app's upload protocol: file.upload.request, then binary frames
+/// (begin / chunks / end); the file is then attached to a message.
+#[tokio::test]
+async fn upload_file_and_attach_it_with_an_image() {
+    let d = start("upload", None);
+    let cwd = d.dir.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+
+    let content = b"line one\nline two\n";
+    send(&mut ws, session(json!({ "type": "file.upload.request", "requestId": "up1", "fileName": "../notes.txt", "mimeType": "text/plain", "size": content.len(), "modifiedAt": "2026-10-11T00:00:00Z" }))).await;
+    let meta = br#"{"mime":"text/plain","size":18,"encoding":"binary","modifiedAt":"2026-10-11T00:00:00Z"}"#;
+    let mut begin_body = (meta.len() as u16).to_be_bytes().to_vec();
+    begin_body.extend_from_slice(meta);
+    ws.send(Message::Binary(file_frame(0x10, "up1", &begin_body))).await.unwrap();
+    ws.send(Message::Binary(file_frame(0x11, "up1", &content[..9]))).await.unwrap();
+    ws.send(Message::Binary(file_frame(0x11, "up1", &content[9..]))).await.unwrap();
+    ws.send(Message::Binary(file_frame(0x12, "up1", b""))).await.unwrap();
+    let up = recv_until(&mut ws, |v| (v["message"]["type"] == "file.upload.response").then(|| v["message"]["payload"].clone())).await;
+    assert!(up["error"].is_null(), "{up}");
+    let file = up["file"].clone();
+    assert_eq!(file["fileName"], "notes.txt", "path components are stripped");
+    let saved = std::fs::read(file["path"].as_str().unwrap()).unwrap();
+    assert_eq!(saved, content);
+
+    // Create an agent and send a message with the file and an inline image.
+    send(&mut ws, session(json!({ "type": "create_agent_request", "requestId": "a1", "config": { "provider": "claude", "cwd": cwd.to_string_lossy(), "modeId": "bypassPermissions" } }))).await;
+    let agent_id = recv_until(&mut ws, |v| {
+        let p = &v["message"]["payload"];
+        (v["message"]["type"] == "status" && p["status"] == "agent_created").then(|| p["agentId"].as_str().unwrap().to_string())
+    })
+    .await;
+    let png = "iVBORw0KGgo=";
+    send(
+        &mut ws,
+        session(json!({ "type": "send_agent_message_request", "requestId": "m1", "agentId": agent_id, "text": "what is in these?", "images": [{ "data": png, "mimeType": "image/png" }], "attachments": [file] })),
+    )
+    .await;
+    recv_until(&mut ws, |v| (v["message"]["type"] == "agent_stream" && v["message"]["payload"]["event"]["type"] == "turn_completed").then_some(())).await;
+    let tl = rpc(&mut ws, json!({ "type": "fetch_agent_timeline_request", "requestId": "t1", "agentId": agent_id, "direction": "tail", "limit": 50 }), "fetch_agent_timeline_response").await;
+    let bubble = tl["entries"].as_array().unwrap().iter().find(|e| e["item"]["type"] == "user_message").unwrap()["item"]["text"].as_str().unwrap().to_string();
+    assert!(bubble.starts_with("what is in these?"), "{bubble}");
+    assert!(bubble.contains("📎") && bubble.contains("notes.txt") && bubble.contains("image.png"), "{bubble}");
+    assert!(!bubble.contains("Path:"), "agent notes stay out of the bubble: {bubble}");
+}
