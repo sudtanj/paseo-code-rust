@@ -83,3 +83,30 @@ pub fn truncate(s: &str, max: usize) -> String {
     }
     format!("{}…", &s[..end])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_keeps_short_strings() {
+        assert_eq!(truncate("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_cuts_on_char_boundary() {
+        // "é" is two bytes; cutting at byte 1 must back up to 0.
+        assert_eq!(truncate("éa", 1), "…");
+        assert_eq!(truncate("abcdef", 3), "abc…");
+    }
+
+    #[test]
+    fn basename_of_paths() {
+        assert_eq!(basename("/home/u/project"), "project");
+    }
+
+    #[test]
+    fn ids_are_unique() {
+        assert_ne!(new_id(), new_id());
+    }
+}

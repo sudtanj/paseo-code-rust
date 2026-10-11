@@ -162,3 +162,71 @@ impl DaemonConfig {
         self.save();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> DaemonConfig {
+        let dir = std::env::temp_dir().join(format!("paseo-lite-cfg-{}", crate::util::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        DaemonConfig::load(&dir)
+    }
+
+    #[test]
+    fn additional_models_are_merged() {
+        let mut c = config();
+        c.apply_patch(&json!({ "providers": { "claude": { "additionalModels": [{ "id": "my-model", "label": "My Model" }] } } }));
+        let merged = c.overrides().merge_models("claude", json!([{ "provider": "claude", "id": "opus", "label": "Opus" }]));
+        let ids: Vec<&str> = merged.as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["opus", "my-model"]);
+    }
+
+    #[test]
+    fn custom_default_wins_and_same_id_replaces_label() {
+        let mut c = config();
+        c.apply_patch(&json!({ "providers": { "codex": { "additionalModels": [
+            { "id": "gpt", "label": "Renamed", "isDefault": true } ] } } }));
+        let merged = c.overrides().merge_models("codex", json!([
+            { "provider": "codex", "id": "gpt", "label": "GPT", "isDefault": true, "thinkingOptions": [] },
+            { "provider": "codex", "id": "other", "label": "Other", "isDefault": true } ]));
+        let arr = merged.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["label"], "Renamed");
+        assert!(arr[0].get("thinkingOptions").is_some(), "built-in extras are kept");
+        assert!(arr[1].get("isDefault").is_none(), "only the custom default remains");
+    }
+
+    #[test]
+    fn provider_patches_merge_and_remove() {
+        let mut c = config();
+        c.apply_patch(&json!({ "providers": { "claude": { "enabled": false } } }));
+        assert!(!c.overrides().enabled("claude"));
+        assert!(c.overrides().enabled("codex"));
+        c.apply_patch(&json!({ "providers": { "claude": { "enabled": null } } }));
+        assert!(c.overrides().enabled("claude"));
+        c.apply_patch(&json!({ "providers": { "claude": { "enabled": false } } }));
+        c.apply_patch(&json!({ "removeProviders": ["claude"] }));
+        assert!(c.overrides().enabled("claude"));
+    }
+
+    #[test]
+    fn append_system_prompt_round_trip_and_persistence() {
+        let dir = std::env::temp_dir().join(format!("paseo-lite-cfg-{}", crate::util::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut c = DaemonConfig::load(&dir);
+        assert!(c.append_system_prompt().is_none());
+        c.apply_patch(&json!({ "appendSystemPrompt": "  be brief  " }));
+        assert_eq!(c.append_system_prompt().as_deref(), Some("be brief"));
+        let reloaded = DaemonConfig::load(&dir);
+        assert_eq!(reloaded.append_system_prompt().as_deref(), Some("be brief"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn environment_controlled_keys_are_not_stored() {
+        let mut c = config();
+        c.apply_patch(&json!({ "relay": { "enabled": false }, "hostnames": ["x"] }));
+        assert!(c.stored.get("relay").is_none() && c.stored.get("hostnames").is_none());
+    }
+}

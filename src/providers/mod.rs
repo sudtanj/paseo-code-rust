@@ -179,3 +179,43 @@ pub fn binary_available(bin: &str) -> bool {
         .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file()))
         .unwrap_or(false)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_known_providers_are_supported() {
+        assert!(is_supported("claude") && is_supported("codex"));
+        assert!(!is_supported("gemini"));
+    }
+
+    #[test]
+    fn default_modes() {
+        assert_eq!(default_mode("codex"), "auto");
+        assert_eq!(default_mode("claude"), "default");
+    }
+
+    #[test]
+    fn claude_catalog_has_one_default_and_context_windows() {
+        let models = claude_models();
+        let defaults = models.as_array().unwrap().iter().filter(|m| m["isDefault"] == true).count();
+        assert_eq!(defaults, 1);
+        assert_eq!(claude_context_window("claude-opus-4-6"), Some(200_000));
+        assert_eq!(claude_context_window("claude-opus-4-6[1m]"), Some(1_000_000));
+        assert_eq!(claude_context_window("unknown"), None);
+    }
+
+    #[test]
+    fn haiku_has_no_effort_levels() {
+        let models = claude_models();
+        let haiku = models.as_array().unwrap().iter().find(|m| m["id"] == "claude-haiku-4-5").unwrap();
+        assert!(haiku.get("thinkingOptions").is_none());
+    }
+
+    #[test]
+    fn missing_binary_is_unavailable() {
+        assert!(!binary_available("definitely-not-a-real-binary-xyz"));
+        assert!(binary_available("/bin/sh") || cfg!(windows));
+    }
+}

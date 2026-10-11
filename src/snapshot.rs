@@ -209,3 +209,53 @@ pub fn workspace_descriptor(ws: &crate::store::WorkspaceRecord, agents: &[&Agent
         "project": project_for(root),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clean_drops_nulls_but_keeps_tool_error() {
+        let v = json!({ "type": "tool_call", "error": null, "extra": null, "detail": { "type": "shell", "command": "ls", "output": null } });
+        let c = clean(v);
+        assert!(c.get("extra").is_none());
+        assert!(c["error"].is_null() && c.get("error").is_some());
+        // A shell detail's null output fails upstream validation, so it must go.
+        assert!(c["detail"].get("output").is_none());
+    }
+
+    #[test]
+    fn clean_keeps_unknown_detail_input_output() {
+        let v = json!({ "detail": { "type": "unknown", "input": null, "output": null } });
+        let c = clean(v);
+        assert!(c["detail"].get("input").is_some());
+        assert!(c["detail"].get("output").is_some());
+    }
+
+    #[test]
+    fn clean_recurses_into_arrays() {
+        let c = clean(json!([{ "a": null, "b": 1 }]));
+        assert_eq!(c, json!([{ "b": 1 }]));
+    }
+
+    #[test]
+    fn strip_nulls_is_shallow() {
+        let c = strip_nulls(json!({ "a": null, "b": { "c": null } }));
+        assert_eq!(c, json!({ "b": { "c": null } }));
+    }
+
+    #[test]
+    fn workspace_id_is_stable_and_distinct() {
+        assert_eq!(workspace_id("/a"), workspace_id("/a"));
+        assert_ne!(workspace_id("/a"), workspace_id("/b"));
+        assert!(workspace_id("/a").starts_with("ws_"));
+    }
+
+    #[test]
+    fn project_names_override_display() {
+        set_project_name("/tmp/snapshot-test-project", Some("  Custom  "));
+        assert_eq!(project_custom_name("/tmp/snapshot-test-project").as_deref(), Some("Custom"));
+        set_project_name("/tmp/snapshot-test-project", None);
+        assert!(project_custom_name("/tmp/snapshot-test-project").is_none());
+    }
+}

@@ -402,3 +402,28 @@ pub async fn get(cwd: &str, compare: &Value, request_id: &str) -> Value {
     let (files, error, too_large) = diff(cwd, compare).await;
     json!({ "requestId": request_id, "cwd": cwd, "files": files, "error": error, "diffTooLarge": too_large })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_a_simple_modified_file() {
+        let diff = "diff --git a/src/a.rs b/src/a.rs\nindex 111..222 100644\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,2 +1,2 @@\n keep\n-old\n+new\n";
+        let files = parse_diff(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["path"], "src/a.rs");
+    }
+
+    #[test]
+    fn empty_diff_has_no_files() {
+        assert!(parse_diff("").is_empty());
+    }
+
+    #[test]
+    fn expands_home() {
+        std::env::set_var("HOME", "/home/tester");
+        assert_eq!(expand("~/x"), PathBuf::from("/home/tester/x"));
+        assert_eq!(expand("/abs"), PathBuf::from("/abs"));
+    }
+}

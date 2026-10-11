@@ -183,3 +183,64 @@ fn dechunk(mut rest: &str) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preview_strips_markdown_and_whitespace() {
+        let p = preview("# Title\n\n- item **one**\n```rust\nlet x = 1;\n```\nlast   line").unwrap();
+        assert_eq!(p, "Title item one let x = 1; last line");
+    }
+
+    #[test]
+    fn preview_truncates_long_text() {
+        let p = preview(&"word ".repeat(100)).unwrap();
+        assert!(p.chars().count() <= PREVIEW_LIMIT);
+        assert!(p.ends_with("..."));
+    }
+
+    #[test]
+    fn preview_empty_is_none() {
+        assert!(preview("  \n ").is_none());
+    }
+
+    #[test]
+    fn payload_titles_and_fallbacks() {
+        let finished = attention_payload("finished", "srv", "ws1", "a1", Some("All done"));
+        assert_eq!(finished["title"], "Agent finished");
+        assert_eq!(finished["body"], "All done");
+        assert_eq!(finished["data"]["agentId"], "a1");
+        let perm = attention_payload("permission", "srv", "ws1", "a1", None);
+        assert_eq!(perm["title"], "Agent needs permission");
+        assert_eq!(perm["body"], "Permission requested.");
+        let err = attention_payload("error", "srv", "ws1", "a1", Some("ignored detail"));
+        assert_eq!(err["body"], "Encountered an error.");
+    }
+
+    #[test]
+    fn parses_plain_and_chunked_responses() {
+        let plain = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        assert_eq!(parse_response(plain).unwrap(), (200, "ok".to_string()));
+        let chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        assert_eq!(parse_response(chunked).unwrap(), (200, "hello world".to_string()));
+        assert!(parse_response(b"garbage").is_err());
+    }
+
+    #[test]
+    fn token_store_lease_and_revoke() {
+        let dir = std::env::temp_dir().join(format!("paseo-lite-push-{}", crate::util::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = TokenStore::load(&dir);
+        store.renew("ExponentPushToken[abc]");
+        store.renew("  ");
+        assert_eq!(store.active(), vec!["ExponentPushToken[abc]".to_string()]);
+        // Survives a reload.
+        let mut again = TokenStore::load(&dir);
+        assert_eq!(again.active().len(), 1);
+        again.revoke("ExponentPushToken[abc]");
+        assert!(again.active().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

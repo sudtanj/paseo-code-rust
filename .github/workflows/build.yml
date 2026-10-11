@@ -30,9 +30,32 @@ jobs:
           name: paseo-lite-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/paseo-lite
 
+  # Unit tests: pure logic inside the daemon (config merge, cleanup guards,
+  # push payloads, snapshot cleaning, retry classification, ...).
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Unit tests
+        run: cargo test --bins
+
+  # Integration tests: start the real binary and drive it over HTTP and
+  # WebSocket like the app does (tests/e2e.rs, with a fake `claude` CLI).
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Integration tests
+        run: cargo test --test e2e -- --test-threads=4
+
   # Static musl binary for the Docker image (Alpine). Published as a rolling
   # "latest" release so the image build downloads it instead of compiling.
   release:
+    needs: [build, unit, integration]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:

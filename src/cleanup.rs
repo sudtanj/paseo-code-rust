@@ -169,3 +169,45 @@ pub async fn delete_project_dir(dir: String, owned: bool, policy: Policy, daemon
     crate::log!("deleted project directory {dir}");
     Ok(true)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn policy_parsing() {
+        assert_eq!(Policy::parse(None), Policy::Safe);
+        assert_eq!(Policy::parse(Some("ALL")), Policy::All);
+        assert_eq!(Policy::parse(Some("never")), Policy::Never);
+        assert_eq!(Policy::parse(Some("0")), Policy::Never);
+        assert_eq!(Policy::parse(Some("bogus")), Policy::Safe);
+    }
+
+    #[test]
+    fn regenerable_ignored_paths() {
+        assert!(regenerable("node_modules/"));
+        assert!(regenerable("web/node_modules/"));
+        assert!(regenerable("target/"));
+        assert!(regenerable("app.log"));
+        assert!(!regenerable(".env"));
+        assert!(!regenerable("data/local.sqlite"));
+    }
+
+    #[test]
+    fn protected_rejects_relative_missing_and_outside_home() {
+        let home = std::env::temp_dir();
+        assert!(protected(Path::new("relative/dir"), &home, &[]).is_some());
+        assert!(protected(Path::new("/definitely/not/here"), &home, &[]).is_some());
+        // The filesystem root and /tmp-level system paths are outside any home.
+        assert!(protected(Path::new("/"), &home, &[]).is_some());
+    }
+
+    #[tokio::test]
+    async fn never_policy_refuses_and_missing_dir_is_ok() {
+        let home = std::env::temp_dir();
+        let r = delete_project_dir("/tmp".into(), true, Policy::Never, home.clone(), vec![]).await;
+        assert!(r.is_err());
+        let gone = format!("/tmp/paseo-lite-missing-{}", crate::util::new_id());
+        assert_eq!(delete_project_dir(gone, true, Policy::Safe, home, vec![]).await, Ok(false));
+    }
+}

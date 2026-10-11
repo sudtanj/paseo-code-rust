@@ -156,3 +156,12 @@ paseo-lite is built and maintained by one person in their spare time. If it save
 - Modifications and original code are under the [PolyForm Noncommercial License 1.0.0](LICENSE-POLYFORM-NONCOMMERCIAL.md), Copyright (c) 2025-present Sudono Tanjung. You can run, read and modify it for personal and other noncommercial use at no cost.
 - **Commercial use** (in or for a business, as a hosted service, or in a commercial product) needs a paid commercial license: contact [@sudtanj](https://github.com/sudtanj).
 - The portions derived from [Paseo](https://github.com/getpaseo/paseo) (Copyright (c) Mohamed Boudra) stay under [Apache-2.0](LICENSE-APACHE), and versions published before the license change remain available under it. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+## Testing
+
+```sh
+cargo test --bins          # unit tests (config, cleanup guards, push, snapshots, retries)
+cargo test --test e2e      # integration tests: real binary over HTTP/WebSocket with a fake claude CLI
+```
+
+CI runs both on every push and pull request, and the rolling `latest` release is only published when they pass.

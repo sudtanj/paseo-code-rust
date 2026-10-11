@@ -1022,3 +1022,31 @@ fn retryable_error(error: &str) -> bool {
     let e = error.to_ascii_lowercase();
     !PERMANENT.iter().any(|p| e.contains(p))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transient_errors_are_retryable() {
+        assert!(retryable_error("claude exited unexpectedly"));
+        assert!(retryable_error("codex app-server exited"));
+        assert!(retryable_error("API Error: 529 overloaded"));
+        assert!(retryable_error("no output for 10 minutes"));
+    }
+
+    #[test]
+    fn permanent_errors_are_not_retried() {
+        assert!(!retryable_error("Not logged in · Please run /login"));
+        assert!(!retryable_error("Invalid API key"));
+        assert!(!retryable_error("Credit balance is too low"));
+        assert!(!retryable_error("failed to start claude: No such file or directory"));
+    }
+
+    #[test]
+    fn cli_selection() {
+        assert_eq!(cli_of("codex"), "codex");
+        assert_eq!(cli_of("claude"), "claude");
+        assert_eq!(cli_label("codex"), "Codex");
+    }
+}
