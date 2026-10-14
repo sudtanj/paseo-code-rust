@@ -185,7 +185,15 @@ pub fn workspace_descriptor(ws: &crate::store::WorkspaceRecord, agents: &[&Agent
     let status = if needs_input { "needs_input" } else if running { "running" } else if failed { "failed" } else if attention { "attention" } else { "done" };
     let activity = agents.iter().map(|a| a.rec.updated_at.clone()).max().unwrap_or_else(|| ws.created_at.clone());
     let probe = crate::checkout::probe(dir);
-    let name = ws.title.clone().or_else(|| probe.as_ref().and_then(|(_, b)| b.clone())).unwrap_or_else(|| basename(dir));
+    // Untitled workspaces are named after their conversation (the first
+    // agent's title, taken from its first message), not the branch, which
+    // is usually the same `main` for every workspace in a project.
+    let topic = agents
+        .iter()
+        .filter(|a| a.rec.title.as_deref().is_some_and(|t| !t.trim().is_empty()))
+        .min_by(|a, b| a.rec.created_at.cmp(&b.rec.created_at))
+        .and_then(|a| a.rec.title.clone());
+    let name = ws.title.clone().or(topic).or_else(|| probe.as_ref().and_then(|(_, b)| b.clone())).unwrap_or_else(|| basename(dir));
     let custom = project_custom_name(root);
     json!({
         "id": ws.id,
