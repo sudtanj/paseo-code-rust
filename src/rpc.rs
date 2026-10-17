@@ -103,9 +103,11 @@ impl Manager {
                 }
             }
             "agent_permission_response" => {
-                if let Some(id) = self.resolve(&agent_key) {
-                    let response = msg.get("response").cloned().unwrap_or_else(|| json!({ "behavior": "deny" }));
-                    self.respond_permission(&id, &rid, response);
+                // The app waits for `agent_permission_resolved`; say why it won't come.
+                let Some(id) = self.resolve(&agent_key) else { return rpc_error(out, &rid, &kind, "agent not found") };
+                let response = msg.get("response").cloned().unwrap_or_else(|| json!({ "behavior": "deny" }));
+                if let Err(e) = self.respond_permission(&id, &rid, response) {
+                    rpc_error(out, &rid, &kind, e);
                 }
             }
             "archive_agent_request" => {

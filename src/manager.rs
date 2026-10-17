@@ -1206,9 +1206,20 @@ impl Manager {
         }
     }
 
-    pub fn respond_permission(&mut self, agent_id: &str, request_id: &str, response: Value) -> bool {
-        let Some(a) = self.agents.get_mut(agent_id) else { return false };
-        let Some(pos) = a.permissions.iter().position(|p| p.request.get("id").and_then(|i| i.as_str()) == Some(request_id)) else { return false };
+    /// Errors are shown on the app's card, which stays open to try again.
+    pub fn respond_permission(&mut self, agent_id: &str, request_id: &str, response: Value) -> Result<(), &'static str> {
+        let Some(a) = self.agents.get_mut(agent_id) else { return Err("agent not found") };
+        let Some(pos) = a.permissions.iter().position(|p| p.request.get("id").and_then(|i| i.as_str()) == Some(request_id)) else {
+            return Err("This request is no longer pending (the turn ended or was restarted)");
+        };
+        let req = &a.permissions[pos].request;
+        let allow = response.get("behavior").and_then(|b| b.as_str()) == Some("allow");
+        if allow && req.get("kind").and_then(|k| k.as_str()) == Some("question") {
+            let original = req.get("input").cloned().unwrap_or(Value::Null);
+            if crate::providers::claude_stream::question_answer(response.get("updatedInput"), &original).is_none() {
+                return Err("Answer at least one question");
+            }
+        }
         let mut perm = a.permissions.remove(pos);
         if let Some(tx) = perm.reply.take() {
             let _ = tx.send(response.clone());
@@ -1220,7 +1231,7 @@ impl Manager {
         self.broadcast(json!({ "type": "agent_permission_resolved", "payload": { "agentId": agent_id, "requestId": request_id, "resolution": response } }));
         self.stream(agent_id, &provider, json!({ "type": "permission_resolved", "provider": provider, "requestId": request_id, "resolution": response }));
         self.publish_agent(agent_id);
-        true
+        Ok(())
     }
 
     /// Release every runtime resource held for an agent (process slot, thread route).

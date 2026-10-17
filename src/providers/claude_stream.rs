@@ -247,7 +247,7 @@ impl StreamState {
             "AskUserQuestion" => "question",
             _ => "tool",
         };
-        let request = json!({
+        let mut request = json!({
             "id": format!("perm-{}", crate::util::new_id()),
             "provider": "claude",
             "name": name,
@@ -256,6 +256,22 @@ impl StreamState {
             "input": input.clone(),
             "detail": tools::claude_detail(&name, &input, None),
         });
+        if kind == "question" {
+            // The app renders its question form from `input`, not a tool detail.
+            request["input"] = question_input(&input);
+            if let Some(r) = request.as_object_mut() {
+                r.remove("detail");
+            }
+            // Title and description also feed the push notification.
+            let first = input.get("questions").and_then(|q| q.get(0));
+            if let Some(text) = first.and_then(|q| s(q, "question")) {
+                request["title"] = json!(text);
+            }
+            let labels: Vec<String> = first.and_then(|q| q.get("options")).and_then(|o| o.as_array()).map(|o| o.iter().filter_map(|o| s(o, "label")).collect()).unwrap_or_default();
+            if !labels.is_empty() {
+                request["description"] = json!(labels.join(" / "));
+            }
+        }
         let (tx, rx) = oneshot::channel::<Value>();
         self.emit(ProviderEvent::Permission { agent_id: self.agent_id.clone(), request, reply: tx });
         let stdin = self.stdin.clone();
@@ -263,7 +279,8 @@ impl StreamState {
             // A dropped sender (agent canceled/archived) counts as a deny.
             let answer = rx.await.unwrap_or_else(|_| json!({ "behavior": "deny", "message": "Permission request canceled" }));
             let inner = if answer.get("behavior").and_then(|b| b.as_str()) == Some("allow") {
-                json!({ "behavior": "allow", "updatedInput": answer.get("updatedInput").cloned().unwrap_or(input) })
+                let updated = if kind == "question" { question_answer(answer.get("updatedInput"), &input) } else { answer.get("updatedInput").cloned() };
+                json!({ "behavior": "allow", "updatedInput": updated.unwrap_or(input) })
             } else {
                 json!({
                     "behavior": "deny",
@@ -275,6 +292,45 @@ impl StreamState {
             let _ = stdin.send(resp.to_string());
         });
     }
+}
+
+/// AskUserQuestion leaves "Other" to the host; the app shows its free-text
+/// box only for questions flagged `allowOther`.
+fn question_input(input: &Value) -> Value {
+    let mut out = input.clone();
+    if let Some(questions) = out.get_mut("questions").and_then(|q| q.as_array_mut()) {
+        for q in questions.iter_mut().filter(|q| q.is_object()) {
+            q["allowOther"] = json!(true);
+        }
+    }
+    out
+}
+
+/// The CLI input for an answered AskUserQuestion. The app keys `answers` by
+/// each question's header, but the CLI matches them by question text, so
+/// re-key them (either key is accepted). None when nothing was answered.
+pub fn question_answer(updated: Option<&Value>, original: &Value) -> Option<Value> {
+    let mut input = original.clone();
+    if let (Some(dst), Some(src)) = (input.as_object_mut(), updated.and_then(|u| u.as_object())) {
+        dst.extend(src.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+    let given = input.get("answers").cloned().unwrap_or(Value::Null);
+    let pick = |key: Option<String>| key.and_then(|k| given.get(&k)?.as_str().map(str::trim).filter(|a| !a.is_empty()).map(String::from));
+    let mut answers = serde_json::Map::new();
+    for q in input.get_mut("questions").and_then(|q| q.as_array_mut()).into_iter().flatten() {
+        if let Some(o) = q.as_object_mut() {
+            o.remove("allowOther");
+        }
+        let Some(text) = s(q, "question") else { continue };
+        if let Some(answer) = pick(Some(text.clone())).or_else(|| pick(s(q, "header"))) {
+            answers.insert(text, json!(answer));
+        }
+    }
+    if answers.is_empty() {
+        return None;
+    }
+    input["answers"] = Value::Object(answers);
+    Some(input)
 }
 
 #[cfg(test)]
@@ -331,5 +387,28 @@ mod tests {
         assert!(ok.iter().any(|e| matches!(e, ProviderEvent::TurnCompleted { .. })));
         let failed = run(&[json!({ "type": "result", "subtype": "error_during_execution", "is_error": true, "result": "API Error: 529 overloaded" })]);
         assert_eq!(limit_of(&failed), None);
+    }
+
+    #[test]
+    fn questions_offer_free_text() {
+        let input = json!({ "questions": [{ "question": "Which DB?", "header": "DB", "options": [{ "label": "Postgres" }], "multiSelect": false }] });
+        assert_eq!(question_input(&input)["questions"][0]["allowOther"], true);
+    }
+
+    #[test]
+    fn question_answers_are_keyed_by_question_text() {
+        let input = json!({ "questions": [
+            { "question": "Which DB?", "header": "DB", "options": [{ "label": "Postgres" }] },
+            { "question": "ORM?", "header": "ORM", "options": [{ "label": "Diesel" }] },
+        ] });
+        // What the app sends back: the input it was given (with allowOther) and answers by header.
+        let mut updated = question_input(&input);
+        updated["answers"] = json!({ "DB": "SQLite, with WAL", "ORM?": "Diesel" });
+        let out = question_answer(Some(&updated), &input).unwrap();
+        assert_eq!(out["answers"], json!({ "Which DB?": "SQLite, with WAL", "ORM?": "Diesel" }));
+        assert!(out["questions"][0].get("allowOther").is_none());
+
+        assert!(question_answer(Some(&json!({ "answers": { "DB": "  " } })), &input).is_none());
+        assert!(question_answer(None, &input).is_none());
     }
 }
