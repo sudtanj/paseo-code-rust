@@ -728,13 +728,19 @@ impl Manager {
             other => other,
         };
         if !compacting {
-            if let Err(e) = &outcome {
-                let hit = self.agents.get_mut(agent_id).and_then(|a| a.limit_hit.take());
-                if self.cfg.resume_after_limit && (hit.is_some() || crate::providers::is_usage_limit(e)) {
-                    let resets_at = hit.flatten().or_else(|| crate::providers::reset_in_text(e));
-                    if self.schedule_limit_wait(agent_id, resets_at) {
-                        return;
+            let hit = self.agents.get_mut(agent_id).and_then(|a| a.limit_hit.take());
+            if self.cfg.resume_after_limit {
+                let waiting = match &outcome {
+                    Err(e) if hit.is_some() || crate::providers::is_usage_limit(e) => {
+                        let resets_at = hit.flatten().or_else(|| crate::providers::reset_in_text(e));
+                        self.schedule_limit_wait(agent_id, resets_at, false)
                     }
+                    // The turn finished, but a sub-agent stopped on the limit with its work undone.
+                    Ok(None) if hit.is_some() => self.schedule_limit_wait(agent_id, hit.flatten(), true),
+                    _ => false,
+                };
+                if waiting {
+                    return;
                 }
             }
             if let Some(reason) = self.retry_reason(agent_id, &outcome) {
@@ -930,33 +936,72 @@ impl Manager {
         true
     }
 
-    /// The account's usage limit stopped the turn: keep it open, wait until
-    /// the limit resets (or poll when the reset time is unknown), then carry
-    /// on. Queued messages run after it. False when the wait would be too
-    /// long; the failure is then reported as usual.
-    fn schedule_limit_wait(&mut self, agent_id: &str, resets_at: Option<u64>) -> bool {
+    /// The account's usage or rate limit stopped the turn (or, with
+    /// `subagents`, one of its sub-agents): keep the turn open, wait until the
+    /// limit resets, then carry on. With no reset time (a rate limit), check
+    /// back after a minute, then twice as long each time up to the poll
+    /// interval. Queued messages run after it. False when the wait would be
+    /// too long; the failure is then reported as usual.
+    fn schedule_limit_wait(&mut self, agent_id: &str, resets_at: Option<u64>, subagents: bool) -> bool {
         let now = unix_now();
-        let (delay, known) = match resets_at {
-            Some(t) if t > now => (Duration::from_secs(t - now) + LIMIT_GRACE, true),
-            _ => (self.cfg.limit_poll, false),
-        };
         let Some(a) = self.agents.get_mut(agent_id) else { return false };
         let since = *a.limit_since.get_or_insert_with(Instant::now);
+        let poll = self.cfg.limit_poll;
+        let (delay, known) = match resets_at {
+            Some(t) if t > now => (Duration::from_secs(t - now) + LIMIT_GRACE, true),
+            _ => (since.elapsed().clamp(LIMIT_FIRST_POLL.min(poll), poll), false),
+        };
         if since.elapsed() + delay > LIMIT_MAX_WAIT {
             crate::warn!("agent {agent_id}: usage limit resets too far out ({}); not waiting", wait_text(delay));
             return false;
         }
         a.retry_at = Some(Instant::now() + delay);
         a.limit_wait = true;
-        a.retry_text = if a.produced { LIMIT_PROMPT.to_string() } else { a.turn_text.clone() };
+        a.retry_text = if subagents { SUBAGENT_LIMIT_PROMPT.to_string() } else if a.produced { LIMIT_PROMPT.to_string() } else { a.turn_text.clone() };
+        let what = if subagents { "A sub-agent stopped at the usage limit" } else { "Usage limit reached" };
         let message = if known {
-            format!("Usage limit reached. Continuing automatically at {} (in {}). Send a message to try sooner, or stop to cancel.", reset_text(now + delay.as_secs()), wait_text(delay))
+            format!("{what}. Continuing the work automatically at {} (in {}). Send a message to try sooner, or stop to cancel.", reset_text(now + delay.as_secs()), wait_text(delay))
         } else {
-            format!("Usage limit reached. Trying again in {}. Send a message to try sooner, or stop to cancel.", wait_text(delay))
+            format!("{what}. Continuing the work automatically once it clears: next try in {}. Send a message to try sooner, or stop to cancel.", wait_text(delay))
         };
         crate::log!("agent {agent_id}: usage limit; continuing in {}", wait_text(delay));
         self.park_turn(agent_id, json!({ "type": "notification", "level": "warning", "message": message }));
         true
+    }
+
+    /// The CLI ran a turn of its own while none was open here (background
+    /// sub-agents reporting back) and it hit the limit: open a turn that
+    /// waits for the reset and then has the unfinished work picked up.
+    fn wait_out_idle_limit(&mut self, agent_id: &str, resets_at: Option<u64>) {
+        let turn_id = new_id();
+        let provider = {
+            let Some(a) = self.agents.get_mut(agent_id) else { return };
+            a.status = "running";
+            a.active_turn = Some((turn_id.clone(), now_iso()));
+            a.turn_text = SUBAGENT_LIMIT_PROMPT.to_string();
+            a.attempts = 0;
+            a.produced = true;
+            a.compacting = false;
+            a.retry_at = None;
+            a.limit_hit = None;
+            a.limit_wait = false;
+            a.limit_since = None;
+            a.last_event = Instant::now();
+            a.rec.provider.clone()
+        };
+        crate::log!("agent {agent_id}: limit hit outside a turn (background sub-agents)");
+        self.stream(agent_id, &provider, json!({ "type": "turn_started", "provider": provider, "turnId": turn_id }));
+        if self.schedule_limit_wait(agent_id, resets_at, true) {
+            self.touch(agent_id);
+            self.persist_pending(agent_id);
+            return;
+        }
+        if let Some(a) = self.agents.get_mut(agent_id) {
+            a.status = "idle";
+            a.active_turn = None;
+        }
+        self.stream(agent_id, &provider, json!({ "type": "turn_canceled", "provider": provider, "turnId": turn_id, "reason": "usage limit" }));
+        self.publish_agent(agent_id);
     }
 
     /// Keep the turn open while the failed attempt is torn down: free its CLI
@@ -1112,8 +1157,14 @@ impl Manager {
             ProviderEvent::TurnCompleted { agent_id } => self.finish_turn(&agent_id, Ok(None)),
             ProviderEvent::TurnCanceled { agent_id, reason } => self.finish_turn(&agent_id, Ok(Some(reason))),
             ProviderEvent::LimitHit { agent_id, resets_at } => {
-                if let Some(a) = self.agents.get_mut(&agent_id).filter(|a| a.status == "running" && a.retry_at.is_none()) {
-                    a.limit_hit = Some(resets_at);
+                let Some(a) = self.agents.get_mut(&agent_id) else { return };
+                if a.status == "running" {
+                    if a.retry_at.is_none() {
+                        a.limit_hit = Some(resets_at);
+                    }
+                } else if a.rec.provider == "claude" && a.rec.archived_at.is_none() && self.cfg.resume_after_limit {
+                    // Only the Claude CLI runs turns of its own; late Codex events are from canceled turns.
+                    self.wait_out_idle_limit(&agent_id, resets_at);
                 }
             }
             ProviderEvent::TurnFailed { agent_id, error } => self.finish_turn(&agent_id, Err(error)),
@@ -1294,9 +1345,13 @@ const RESUME_PROMPT: &str = "The server was restarted while you were working, wh
 const LIMIT_GRACE: Duration = Duration::from_secs(60);
 /// Give up waiting for a usage limit after this long (weekly limits included).
 const LIMIT_MAX_WAIT: Duration = Duration::from_secs(8 * 24 * 3600);
+/// First check-back after a limit with no reset time (rate limits clear in minutes).
+const LIMIT_FIRST_POLL: Duration = Duration::from_secs(60);
 
 /// Sent when the usage limit has reset and a turn it stopped carries on.
-const LIMIT_PROMPT: &str = "Your usage limit has reset. Continue from where you left off and finish the task.";
+const LIMIT_PROMPT: &str = "The usage or rate limit that stopped you has reset. Continue from where you left off and finish the task.";
+/// Sent when the limit that stopped sub-agents (yours or background ones) has reset.
+const SUBAGENT_LIMIT_PROMPT: &str = "Some of your sub-agents stopped early because of the usage or rate limit, which has now reset. Check what they left unfinished and finish it, re-launching them if needed. If nothing is left to do, say so briefly.";
 
 /// Transient failures are retried; auth, quota and setup problems won't fix
 /// themselves, so those surface immediately.

@@ -186,14 +186,15 @@ pub fn binary_available(bin: &str) -> bool {
 }
 
 
-/// Does an error read like the account's usage limit, which clears by itself
-/// when the window resets? Spend caps and credit balances don't.
+/// Does an error read like the account's usage or rate limit (HTTP 429),
+/// which clears by itself? Spend caps and credit balances don't.
 pub fn is_usage_limit(text: &str) -> bool {
     let t = text.to_ascii_lowercase();
     if ["spend limit", "usage credits", "credit balance", "budget", "context"].iter().any(|p| t.contains(p)) {
         return false;
     }
-    t.contains("usage limit") || t.contains("usagelimitexceeded") || t.contains("limit reached") || ((t.contains("hit your") || t.contains("reached your")) && t.contains("limit"))
+    let rate_limited = t.contains("rate limit") || t.contains("rate_limit") || t.contains("(429)") || t.contains("429 too many") || t.contains("too many requests");
+    rate_limited || t.contains("usage limit") || t.contains("usagelimitexceeded") || t.contains("limit reached") || ((t.contains("hit your") || t.contains("reached your")) && t.contains("limit"))
 }
 
 /// The reset time in the older "Claude AI usage limit reached|1760000000" text.
@@ -246,6 +247,8 @@ mod tests {
         assert!(is_usage_limit("You've hit your usage limit. Upgrade to Plus to continue using Codex"));
         assert!(is_usage_limit("Claude AI usage limit reached|1760000000"));
         assert!(is_usage_limit("You've reached your Fable limit."));
+        assert!(is_usage_limit("API Error: Request rejected (429) \u{b7} This request would exceed your account's rate limit. Please try again later."));
+        assert!(is_usage_limit("exceeded retry limit, last status: 429 Too Many Requests"));
         assert!(!is_usage_limit("You've hit your monthly spend limit"));
         assert!(!is_usage_limit("Context limit reached \u{b7} /compact or /clear to continue"));
         assert!(!is_usage_limit("Credit balance is too low"));

@@ -25,6 +25,8 @@ pub struct StreamState {
     limit_info: Option<Value>,
     /// The turn was refused by the usage limit (`api_error: usage_limit_reached`), with its reset when given.
     limit_refused: Option<Option<u64>>,
+    /// A sub-agent of the running turn stopped on the usage or rate limit.
+    sub_limited: bool,
 }
 
 fn s(v: &Value, key: &str) -> Option<String> {
@@ -33,7 +35,7 @@ fn s(v: &Value, key: &str) -> Option<String> {
 
 impl StreamState {
     pub fn new(agent_id: String, events: EventTx, stdin: mpsc::UnboundedSender<String>, interrupted: Arc<AtomicBool>, session_id: Option<String>) -> Self {
-        StreamState { agent_id, events, stdin, interrupted, session_id, tools: HashMap::new(), streamed: HashSet::new(), current_message: None, context_tokens: None, limit_info: None, limit_refused: None }
+        StreamState { agent_id, events, stdin, interrupted, session_id, tools: HashMap::new(), streamed: HashSet::new(), current_message: None, context_tokens: None, limit_info: None, limit_refused: None, sub_limited: false }
     }
 
     fn emit(&self, ev: ProviderEvent) {
@@ -72,6 +74,7 @@ impl StreamState {
             }
             "stream_event" if !is_sidechain => self.handle_stream_event(msg.get("event").unwrap_or(&Value::Null)),
             "assistant" if !is_sidechain => self.handle_assistant(&msg),
+            "assistant" => self.sub_limited |= is_limit_message(&msg),
             "user" if !is_sidechain => self.handle_tool_results(&msg),
             "rate_limit_event" => self.limit_info = msg.get("rate_limit_info").cloned(),
             "result" => self.handle_result(&msg),
@@ -151,6 +154,9 @@ impl StreamState {
     }
 
     fn handle_tool_results(&mut self, msg: &Value) {
+        if let Some(summary) = failed_task_summary(msg.pointer("/message/content").unwrap_or(&Value::Null)) {
+            self.sub_limited |= super::is_usage_limit(&summary);
+        }
         let Some(blocks) = msg.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array()) else { return };
         for block in blocks {
             if !block.get("type").and_then(|t| t.as_str()).map(|t| t.ends_with("tool_result")).unwrap_or(false) {
@@ -164,6 +170,10 @@ impl StreamState {
                 _ => String::new(),
             };
             let failed = block.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+            // A sub-agent that died on the limit reports it as its result.
+            if matches!(name.as_str(), "Task" | "Agent") && output.len() < 2000 && output.contains("API Error") && super::is_usage_limit(&output) {
+                self.sub_limited = true;
+            }
             let detail = tools::claude_detail(&name, &input, Some(&output));
             let (status, error) = if failed { ("failed", Some(output)) } else { ("completed", None) };
             self.timeline(tools::tool_call(&id, &name, detail, status, error));
@@ -200,7 +210,13 @@ impl StreamState {
                 .or_else(|| s(msg, "result"))
                 .unwrap_or_else(|| s(msg, "subtype").unwrap_or_else(|| "turn failed".into()))
         };
+        let sub_reset = self.limit_info.as_ref().filter(|i| s(i, "status").as_deref() == Some("rejected")).and_then(|i| i.get("resetsAt")).and_then(|v| v.as_u64());
+        let sub_limited = std::mem::take(&mut self.sub_limited);
         let limit = self.usage_limit(msg, ok, &error());
+        if ok && limit.is_none() && sub_limited && !self.interrupted.load(Ordering::SeqCst) {
+            // The turn itself finished; the manager waits out the limit and has the work picked up.
+            self.emit(ProviderEvent::LimitHit { agent_id: agent_id.clone(), resets_at: sub_reset });
+        }
         if self.interrupted.swap(false, Ordering::SeqCst) {
             self.emit(ProviderEvent::TurnCanceled { agent_id, reason: "interrupted".into() });
         } else if let Some(resets_at) = limit {
@@ -222,7 +238,8 @@ impl StreamState {
         let rejected = info.filter(|i| s(i, "status").as_deref() == Some("rejected"));
         let text = s(msg, "result").unwrap_or_default();
         let lead = text.trim_start().to_ascii_lowercase();
-        let says_so = text.len() < 300 && (lead.starts_with("you") || lead.starts_with("claude ai usage limit")) && super::is_usage_limit(&text);
+        // A reply merely mentioning rate limits ("You can raise the rate limit...") is not one.
+        let says_so = text.len() < 300 && (lead.starts_with("you") || lead.starts_with("claude ai usage limit")) && !lead.contains("rate limit") && super::is_usage_limit(&text);
         let hit = refused.is_some() || (!ok && (rejected.is_some() || super::is_usage_limit(error))) || (ok && says_so);
         if !hit {
             return None;
@@ -292,6 +309,28 @@ impl StreamState {
             let _ = stdin.send(resp.to_string());
         });
     }
+}
+
+/// Is this assistant message the CLI's report of a usage or rate limit error?
+fn is_limit_message(msg: &Value) -> bool {
+    let flagged = ["error", "api_error"].iter().any(|k| matches!(s(msg, k).as_deref(), Some("rate_limit" | "usage_limit_reached")));
+    let text = msg.pointer("/message/content/0/text").and_then(|t| t.as_str()).unwrap_or("");
+    flagged || (text.starts_with("API Error") && super::is_usage_limit(text))
+}
+
+/// The summary of a background sub-agent's `<task-notification>` that says
+/// it failed ("Agent \"...\" failed: Agent terminated early due to an API error: ...").
+fn failed_task_summary(content: &Value) -> Option<String> {
+    let text = match content {
+        Value::String(t) => t.clone(),
+        Value::Array(parts) => parts.iter().filter_map(|p| s(p, "text")).collect::<Vec<_>>().join("\n"),
+        _ => return None,
+    };
+    if !text.contains("<task-notification>") || !text.contains("<status>failed</status>") {
+        return None;
+    }
+    let (_, rest) = text.split_once("<summary>")?;
+    rest.split_once("</summary>").map(|(summary, _)| summary.to_string())
 }
 
 /// AskUserQuestion leaves "Other" to the host; the app shows its free-text
@@ -410,5 +449,37 @@ mod tests {
 
         assert!(question_answer(Some(&json!({ "answers": { "DB": "  " } })), &input).is_none());
         assert!(question_answer(None, &input).is_none());
+    }
+
+    #[test]
+    fn rate_limit_rejection_is_a_limit() {
+        let events = run(&[json!({ "type": "result", "subtype": "error_during_execution", "is_error": true, "result": "API Error: Request rejected (429) \u{b7} This request would exceed your account's rate limit. Please try again later." })]);
+        assert_eq!(limit_of(&events), Some(None));
+        // Merely mentioning rate limits in a reply is not one.
+        let ok = run(&[json!({ "type": "result", "subtype": "success", "result": "You can raise the rate limit in config.toml." })]);
+        assert_eq!(limit_of(&ok), None);
+    }
+
+    #[test]
+    fn subagent_limit_is_reported_on_a_finished_turn() {
+        let done = json!({ "type": "result", "subtype": "success", "result": "Done." });
+        // A sub-agent's own API error (sidechain message).
+        let sidechain = json!({ "type": "assistant", "parent_tool_use_id": "toolu_1", "error": "rate_limit", "message": { "content": [{ "type": "text", "text": "API Error: Request rejected (429)" }] } });
+        let events = run(&[sidechain, done.clone()]);
+        let at = events.iter().position(|e| matches!(e, ProviderEvent::LimitHit { .. })).unwrap();
+        assert!(matches!(events[at + 1], ProviderEvent::TurnCompleted { .. }));
+
+        // A foreground Task whose result is the limit error.
+        let task = json!({ "type": "assistant", "message": { "content": [{ "type": "tool_use", "id": "toolu_2", "name": "Task", "input": { "description": "x" } }] } });
+        let result = json!({ "type": "user", "message": { "content": [{ "type": "tool_result", "tool_use_id": "toolu_2", "is_error": true, "content": "Agent terminated early due to an API error: API Error: Request rejected (429) \u{b7} rate limit" }] } });
+        assert_eq!(limit_of(&run(&[task, result, done.clone()])), Some(None));
+
+        // A background sub-agent's failure notification.
+        let note = "<task-notification>\n<status>failed</status>\n<summary>Agent \"Review\" failed: Agent terminated early due to an API error: API Error: Request rejected (429) (error type rate_limit, HTTP 429)</summary>\n<result>Reading the context first</result>\n</task-notification>";
+        let notified = json!({ "type": "user", "message": { "content": note } });
+        assert_eq!(limit_of(&run(&[notified, done.clone()])), Some(None));
+
+        // The next turn starts clean.
+        assert_eq!(limit_of(&run(&[done])), None);
     }
 }
